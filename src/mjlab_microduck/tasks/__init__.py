@@ -6,6 +6,14 @@ from mjlab_microduck.train_hook import maybe_submit_to_hf_jobs
 # train_hook.py). A no-op without the flag.
 maybe_submit_to_hf_jobs()
 
+from mjlab_microduck.cpu_distributed import maybe_patch_rsl_rl_for_cpu
+
+# Teach rsl_rl's distributed path to run on a CPU process group, so a machine
+# with no CUDA GPU can still spread one run across its cores (gloo instead of
+# nccl, device "cpu" instead of "cuda:N"). A no-op unless WORLD_SIZE > 1, i.e.
+# unless scripts/train_cpu_dist.py spawned this process.
+maybe_patch_rsl_rl_for_cpu()
+
 from mjlab.tasks.registry import register_mjlab_task
 from mjlab.tasks.velocity.rl import VelocityOnPolicyRunner
 
