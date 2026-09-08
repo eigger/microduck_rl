@@ -249,3 +249,12 @@ Never launch a long run without one.
   robot, with the correct command-slot writes (a posture flag lives in the
   twist vx slot; feeding all-zeros means "stand", which looks like "policy
   ignores the button").
+
+## 작업 일지 (Work Journal)
+
+의미 있는 작업(학습 실행, 막힌 문제 해결, 측정, 예상 빗나감)을 마치면
+`docs/journal-ko.md` 맨 끝에 일지를 덧붙입니다. 형식과 규칙은 `docs/journal-rules.md`에 있습니다.
+일지 본문은 계속 길어지므로 규칙을 확인하려고 통째로 읽지 마세요.
+
+@docs/journal-rules.md
+

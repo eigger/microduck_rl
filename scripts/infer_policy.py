@@ -7,16 +7,30 @@ import math
 import os
 import pickle
 import queue
-import select
 import sys
-import termios
 import threading
 import time
-import tty
+if os.name == 'nt':
+    import msvcrt
+    select = None
+    termios = None
+    tty = None
+else:
+    import select
+    import termios
+    import tty
+
 import numpy as np
 import mujoco
 import mujoco.viewer
 import onnxruntime as ort
+
+if sys.platform == 'win32':
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    if hasattr(sys.stderr, 'reconfigure'):
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 
 MICRODUCK_XML = "src/mjlab_microduck/robot/microduck/scene.xml"
 # MICRODUCK_XML = "src/mjlab_microduck/robot/microduck/scene_ramps.xml"
@@ -146,8 +160,9 @@ class TerminalInput:
     Replaces the MuJoCo viewer key_callback: keypresses in the viewer window
     also fire the viewer's built-in visualization shortcuts (frames, labels,
     rendering toggles…), so commands are read from the terminal instead.
-    Arrow keys arrive as ESC [ A/B/C/D escape sequences and are translated to
-    symbolic names ("up"/"down"/"left"/"right"); letters are lowercased.
+    Arrow keys arrive as ESC [ A/B/C/D escape sequences (or Windows extended
+    keys via msvcrt) and are translated to symbolic names ("up"/"down"/"left"/"right");
+    letters are lowercased.
     cbreak (not raw) mode keeps ISIG enabled, so Ctrl+C still works.
     """
 
@@ -155,24 +170,47 @@ class TerminalInput:
 
     def __init__(self):
         self._queue = queue.Queue()
-        self.enabled = sys.stdin.isatty()
+        self.enabled = sys.stdin.isatty() if hasattr(sys.stdin, "isatty") else False
         self._fd = sys.stdin.fileno() if self.enabled else -1
         self._old_attrs = None
+        self._old_console_mode = None
         self._stop = threading.Event()
 
     def __enter__(self):
-        if not self.enabled:
-            print("WARNING: stdin is not a TTY — keyboard control disabled")
-            return self
-        self._old_attrs = termios.tcgetattr(self._fd)
-        tty.setcbreak(self._fd)
+        if os.name != 'nt':
+            if not self.enabled:
+                print("WARNING: stdin is not a TTY - keyboard control via terminal disabled (viewer keys still work)")
+                return self
+            self._old_attrs = termios.tcgetattr(self._fd)
+            tty.setcbreak(self._fd)
+        elif self.enabled:
+            # On Windows, disable QuickEdit mode so clicking console does not freeze the simulator
+            try:
+                import ctypes
+                from ctypes import wintypes
+                kernel32 = ctypes.windll.kernel32
+                hStdin = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+                mode = wintypes.DWORD()
+                if kernel32.GetConsoleMode(hStdin, ctypes.byref(mode)):
+                    self._old_console_mode = mode.value
+                    new_mode = (mode.value & ~0x0040) | 0x0080  # disable ENABLE_QUICK_EDIT_MODE
+                    kernel32.SetConsoleMode(hStdin, new_mode)
+            except Exception:
+                pass
         threading.Thread(target=self._reader, daemon=True).start()
         return self
 
     def __exit__(self, *exc):
         self._stop.set()
-        if self._old_attrs is not None:
+        if os.name != 'nt' and self._old_attrs is not None:
             termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old_attrs)
+        elif os.name == 'nt' and self._old_console_mode is not None:
+            try:
+                import ctypes
+                hStdin = ctypes.windll.kernel32.GetStdHandle(-10)
+                ctypes.windll.kernel32.SetConsoleMode(hStdin, self._old_console_mode)
+            except Exception:
+                pass
 
     def _read1(self, timeout):
         """Read one byte from stdin, or None on timeout. os.read (unbuffered):
@@ -185,6 +223,44 @@ class TerminalInput:
         return data.decode(errors="ignore") if data else None
 
     def _reader(self):
+        if os.name == 'nt':
+            while not self._stop.is_set():
+                if self.enabled and msvcrt.kbhit():
+                    ch = msvcrt.getch()
+                    if ch in (b'\x00', b'\xe0'):
+                        ch2 = msvcrt.getch()
+                        arrows = {b'H': 'up', b'P': 'down', b'K': 'left', b'M': 'right'}
+                        name = arrows.get(ch2)
+                        if name:
+                            self._queue.put(name)
+                    elif ch == b'\x03':  # Ctrl+C
+                        self._stop.set()
+                        break
+                    else:
+                        try:
+                            s = ch.decode('utf-8', errors='ignore')
+                            if s:
+                                self._queue.put(s.lower() if s.isalpha() else s)
+                        except Exception:
+                            pass
+                elif not self.enabled:
+                    try:
+                        line = sys.stdin.readline()
+                        if not line:
+                            time.sleep(0.05)
+                            continue
+                        line = line.strip()
+                        if line in ("up", "down", "left", "right"):
+                            self._queue.put(line)
+                        else:
+                            for ch in line:
+                                self._queue.put(ch.lower() if ch.isalpha() else ch)
+                    except Exception:
+                        time.sleep(0.05)
+                else:
+                    time.sleep(0.02)
+            return
+
         while not self._stop.is_set():
             ch = self._read1(0.1)
             if not ch:
@@ -216,8 +292,8 @@ class PolicyInference:
                  sit_onnx_path=None, new_cmd_obs=False, slope_onnx_path=None,
                  sitstand_onnx_path=None,
                  kick_left_onnx_path=None, kick_right_onnx_path=None,
-                 roulade_onnx_path=None,
-                 kick_duration=3.0, roulade_duration=2.0):
+                 roulade_onnx_path=None, jump_onnx_path=None,
+                 kick_duration=3.0, roulade_duration=2.0, jump_duration=0.55):
         self.bam_ctrl = bam_ctrl  # bam.mujoco.MujocoController (None = legacy position actuators)
         self.model = model
         self.data = data
@@ -324,6 +400,7 @@ class PolicyInference:
             ("kick_left", kick_left_onnx_path, kick_duration),
             ("kick_right", kick_right_onnx_path, kick_duration),
             ("roulade", roulade_onnx_path, roulade_duration),
+            ("jump", jump_onnx_path, jump_duration),
         ):
             if not path:
                 continue
@@ -791,12 +868,12 @@ class PolicyInference:
         name = self.behavior_mode
         self.behavior_mode = None
         self.vel_cmd = np.zeros(3, dtype=np.float32)
-        if self.walking_session:
-            self.current_policy = "walking"
-            self.ort_session = self.walking_session
-        elif self.standing_session:
+        if self.standing_session:
             self.current_policy = "standing"
             self.ort_session = self.standing_session
+        elif self.walking_session:
+            self.current_policy = "walking"
+            self.ort_session = self.walking_session
         else:
             # sitstand-only setup: the sitstand policy holds the stand (flag 0).
             self.current_policy = "sit"
@@ -906,8 +983,10 @@ def main():
     parser.add_argument("--kick-left", type=str, default=None, help="Path to LEFT-foot ball kick policy ONNX (press K to trigger). Requires --new-cmd-obs. Loads a scene with a ball.")
     parser.add_argument("--kick-right", type=str, default=None, help="Path to RIGHT-foot ball kick policy ONNX (press L to trigger). Requires --new-cmd-obs. Loads a scene with a ball.")
     parser.add_argument("--roulade", type=str, default=None, help="Path to roulade (forward roll) policy ONNX (press R to trigger). Requires --new-cmd-obs.")
+    parser.add_argument("--jump", type=str, default=None, help="Path to jump policy ONNX (press J to trigger). Requires --new-cmd-obs.")
     parser.add_argument("--kick-duration", type=float, default=3.0, help="Seconds a kick policy stays active before handing back to standing/walking (default: 3.0)")
     parser.add_argument("--roulade-duration", type=float, default=2.0, help="Seconds the roulade policy stays active before handing back to standing/walking (default: 2.0, ~the roll itself; the standing/walking policy takes over for the settle)")
+    parser.add_argument("--jump-duration", type=float, default=0.55, help="Seconds the jump policy stays active before handing back to standing/walking (default: 0.55, ~deep jump and landing; the standing policy takes over for the rest)")
     parser.add_argument("--lin-vel-x", type=float, default=0.0, help="Initial linear velocity X command (m/s)")
     parser.add_argument("--lin-vel-y", type=float, default=0.0, help="Initial linear velocity Y command (m/s)")
     parser.add_argument("--ang-vel-z", type=float, default=0.0, help="Initial angular velocity Z command (rad/s)")
@@ -950,13 +1029,23 @@ def main():
     args = parser.parse_args()
 
     if not args.walking and not args.standing and not args.sitstand:
-        parser.error("At least one of --walking, --standing or --sitstand must be provided")
+        if os.path.exists("policies/alpha_walking.onnx"):
+            args.walking = "policies/alpha_walking.onnx"
+            args.standing = "policies/alpha_stand.onnx" if os.path.exists("policies/alpha_stand.onnx") else None
+            args.sitstand = "policies/alpha_sitstand.onnx" if os.path.exists("policies/alpha_sitstand.onnx") else None
+            args.ground_pick = "policies/alpha_ground_pick.onnx" if os.path.exists("policies/alpha_ground_pick.onnx") else None
+            args.roulade = "policies/roulade.onnx" if os.path.exists("policies/roulade.onnx") else None
+            args.jump = "policies/jump.onnx" if os.path.exists("policies/jump.onnx") else None
+            args.new_cmd_obs = True
+            print("Auto-loaded pre-trained policies from policies/ directory.")
+        else:
+            parser.error("At least one of --walking, --standing or --sitstand must be provided")
     if args.sitstand and not args.new_cmd_obs:
         parser.error("--sitstand policies use the unified 13D command obs (61D); add --new-cmd-obs")
-    if (args.kick_left or args.kick_right or args.roulade) and not args.new_cmd_obs:
-        parser.error("--kick-left/--kick-right/--roulade policies use the unified 13D command obs (61D); add --new-cmd-obs")
-    if (args.kick_left or args.kick_right or args.roulade) and args.roller:
-        parser.error("kick/roulade policies are trained on the walking robot, not the roller model")
+    if (args.kick_left or args.kick_right or args.roulade or args.jump) and not args.new_cmd_obs:
+        parser.error("--kick-left/--kick-right/--roulade/--jump policies use the unified 13D command obs (61D); add --new-cmd-obs")
+    if (args.kick_left or args.kick_right or args.roulade or args.jump) and args.roller:
+        parser.error("kick/roulade/jump policies are trained on the walking robot, not the roller model")
 
     # Parse delay arguments
     delay_min_lag = 0
@@ -1057,8 +1146,10 @@ def main():
         kick_left_onnx_path=args.kick_left,
         kick_right_onnx_path=args.kick_right,
         roulade_onnx_path=args.roulade,
+        jump_onnx_path=args.jump,
         kick_duration=args.kick_duration,
         roulade_duration=args.roulade_duration,
+        jump_duration=args.jump_duration,
     )
     policy.set_vel_cmd(args.lin_vel_x, args.lin_vel_y, args.ang_vel_z)
 
@@ -1138,7 +1229,7 @@ def main():
         print(f"{kind} policy: loaded  (press Y to toggle)")
     if policy.slope_session:
         print(f"Slope policy: loaded  (press Y to toggle, passive descent)")
-    _behavior_keys = {"kick_left": "K", "kick_right": "L", "roulade": "R"}
+    _behavior_keys = {"kick_left": "K", "kick_right": "L", "roulade": "R", "jump": "J"}
     for _name in policy.behavior_sessions:
         print(f"{_name} policy: loaded  (press {_behavior_keys[_name]}, "
               f"auto-return after {policy.behavior_durations[_name]:.1f}s)")
@@ -1274,6 +1365,8 @@ def main():
                 policy.trigger_behavior("kick_right")
             elif key == "r":
                 policy.trigger_behavior("roulade")
+            elif key == "j":
+                policy.trigger_behavior("jump")
             elif key == "q":
                 quit_requested = True
                 print("Quit requested")
@@ -1324,7 +1417,7 @@ def main():
         except Exception as e:
             print(f"Key press error: {e}")
 
-    print("\nKeyboard controls (type in THIS terminal — the viewer window no longer captures keys):")
+    print("\nKeyboard controls (type in terminal or viewer window):")
     print("  [ Velocity mode (default) ]")
     print("  UP arrow:         increase lin_vel_x (push/accelerate)")
     print("  DOWN arrow:       decrease lin_vel_x (0=coast, negative=brake)")
@@ -1341,6 +1434,7 @@ def main():
     print("  K:                kick with LEFT foot (requires --kick-left)")
     print("  L:                kick with RIGHT foot (requires --kick-right)")
     print("  R:                roulade / forward roll (requires --roulade)")
+    print("  J:                jump into air (requires --jump)")
     print(f"  P:                random push (trunk vel = {PUSH_MAX:.1f} m/s in random direction)")
     print("  Q:                quit")
     print("  [ Body pose mode — press B to toggle ]")
@@ -1357,9 +1451,27 @@ def main():
     print("  A / E:            head_roll ±step")
     print("  SPACE:            reset head offset to zero")
 
+    def viewer_key_callback(key):
+        GLFW_ARROWS = {265: "up", 264: "down", 263: "left", 262: "right", 32: " "}
+        if key in GLFW_ARROWS:
+            term._queue.put(GLFW_ARROWS[key])
+        elif 32 <= key <= 126:
+            term._queue.put(chr(key).lower())
+
+    print("\n[Simulator] Opening 3D MuJoCo viewer window...")
     with TerminalInput() as term, \
-         mujoco.viewer.launch_passive(model, data, show_left_ui=False, show_right_ui=False) as viewer:
+         mujoco.viewer.launch_passive(model, data, key_callback=viewer_key_callback, show_left_ui=False, show_right_ui=False) as viewer:
         viewer.sync()
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                hwnd = ctypes.windll.user32.FindWindowW("GLFW30", None)
+                if hwnd:
+                    ctypes.windll.user32.ShowWindow(hwnd, 5)  # SW_SHOW
+                    ctypes.windll.user32.SetForegroundWindow(hwnd)
+            except Exception:
+                pass
+        print(">>> 3D Viewer window is OPEN! (Click the 3D window and press 'J' to Jump) <<<\n")
         start_time = time.time()
 
         if args.record:

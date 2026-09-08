@@ -23,6 +23,17 @@ import sys
 
 
 def main() -> int | None:
+    if sys.platform == "win32":
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+    # Default to tensorboard logger for offline training unless explicitly overridden
+    if not any(h in sys.argv for h in ("-h", "--help")):
+        if not any(arg.startswith("--agent.logger") for arg in sys.argv):
+            sys.argv.extend(["--agent.logger", "tensorboard"])
+
     # This import runs mjlab's plugin loader, which imports
     # mjlab_microduck.tasks -> train_hook.maybe_submit_to_hf_jobs(). A
     # `--hf-jobs` invocation submits and exits inside the import below; it

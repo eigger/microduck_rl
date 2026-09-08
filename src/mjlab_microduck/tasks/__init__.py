@@ -83,7 +83,20 @@ from .microduck_roulade_env_cfg import (
     make_microduck_roulade_env_cfg,
     MicroduckRouladeRlCfg,
 )
+from .microduck_jump_env_cfg import (
+    make_microduck_jump_env_cfg,
+    MicroduckJumpRlCfg,
+)
 from .backlash import make_backlash_variant
+
+# Jump task — crouch, explosive upward launch, both feet airborne, landing rest
+register_mjlab_task(
+    task_id="Mjlab-Jump-Flat-MicroDuck",
+    env_cfg=make_microduck_jump_env_cfg(),
+    play_env_cfg=make_microduck_jump_env_cfg(play=True),
+    rl_cfg=MicroduckJumpRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
 
 # Standard velocity task
 register_mjlab_task(
