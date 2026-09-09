@@ -1813,6 +1813,12 @@ Run 13의 탐색 절벽 실패를 극복하고, 검증된 Run 12 체크포인트
    - 그러나 $t=0.38$s 착지 후, `jump_duration`이 $1.0\,\text{s}$로 길게 설정되어 점프 정책이 착지 후에도 0.62초 동안 억지로 유지됨.
    - 이 구간 동안 점프 정책이 머리(280g)를 앞으로 $92^\circ$ 고꾸라뜨리고 몸통 피치를 $+30^\circ$까지 앞으로 기울임.
    - $t=1.00$s에 `standing` 정책으로 핸드오버되는 순간, 이미 $+30^\circ$로 엎어지고 있던 상태라 회복하지 못하고 안면 충돌 전복(Fall over) 발생.
+
+   ![1.0s 점프 지속 전복 버그 롤아웃](media/run26_rollout.gif)
+
+   | ![정상 도약 t=0.30s](media/sim_frame_15.png) | ![버그: 머리 처박힘 t=0.90s](media/sim_frame_45.png) | ![버그: 안면 충돌 전복 t=1.14s](media/sim_frame_57.png) | ![0.48s 핸드오버 직립 t=1.18s](media/handover_frame_59.png) |
+   | :---: | :---: | :---: | :---: |
+   | Step 15: 5.4cm 공중 도약 | Step 45: 머리 +92.6° 고꾸라짐 | Step 57: 안면 전복 (Fallen) | Step 59: 완벽한 직립 정지 복귀 |
 2. **이전 보고의 치명적 오류 반성 (AGENTS.md 수칙 위반)**:
    - AGENTS.md의 "A settle test that only records z reports fallen states as resting fine" 경고를 망각하고, $t=1.0$s 시점의 $Z = 117.6\,\text{mm}$만 측정하여 "100% 직립 복귀"라고 거짓 보고함.
    - 실제로는 피치가 $+30^\circ$ 기울어 $t=1.16$s에 완전히 엎어지고 있었음.
@@ -1858,6 +1864,10 @@ Run 13의 탐색 절벽 실패를 극복하고, 검증된 Run 12 체크포인트
    - **Run 30 (`model_2395.pt`)**: 이륙 $V_z = +0.675\text{ m/s}$, 몸통 정점 $123.8\text{ mm}$, 그러나 공중에서 다리를 완전히 펴고 있어 양발 클리어런스는 $11.6\text{ mm}$ (1.1 cm)에 불과.
    - **Run 31 (`model_1647.pt`)**: 이륙 $V_z = +0.541\text{ m/s}$, 몸통 정점 $119.3\text{ mm}$, 양발 클리어런스 $7.3\text{ mm}$ (0.7 cm).
    - **Run 26 (`model_1498.pt`)**: 이륙 $V_z = +0.649\text{ m/s}$, 몸통 정점 **$146.0\text{ mm}$**, 공중 양 무릎 1.04 rad 턱킹으로 양발 클리어런스 **$53.8\text{ mm}$ (5.4 cm)** 달성.
+
+   | ![Run 30: 다리 편 상태 (클리어런스 1.1cm)](media/run30_sideview.gif) | ![Run 31: 도약 미흡 (클리어런스 0.7cm)](media/run31_sideview.gif) | ![Run 26: 공중 무릎 턱킹 (클리어런스 5.4cm)](media/run26_sideview.gif) |
+   | :---: | :---: | :---: |
+   | Run 30: 다리를 펴서 11.6mm | Run 31: 추진 미흡 7.3mm | **Run 26: 1.04 rad 턱킹으로 53.8mm** |
 3. **최종 정책 배포**:
    - 5.4cm의 최고 체공 높이를 기록한 Run 26 모델(`model_1498.pt`)을 ONNX로 변환하여 `policies/jump.onnx`로 배포 완료.
    - `run_simulator.bat` 실행 시 J 키 입력으로 즉시 5.4cm 고도 점프 동작 가능하도록 설정 완료.
@@ -1902,6 +1912,8 @@ Run 13의 탐색 절벽 실패를 극복하고, 검증된 Run 12 체크포인트
    - `jump_takeoff_velocity_reward` 및 `jump_flight_reward`에 $\text{sym\_gate} = \exp(-(\Delta z_{\text{feet}} / \sigma)^2)$ 승수 게이트 적용.
    - 비대칭으로 도약 시 체공 보상이 23.5점에서 0.5점으로 98% 강제 삭감되도록 차단.
    - 결과: 착지 시점(Step 18) 양발 클리어런스가 L=5.0mm, R=6.3mm로 100% 동시 터치다운 달성, 스텝 25 이후 $Z=116.0\text{ mm}$, Pitch $+0.4^\circ$, $V_z = \pm 0.000\text{ m/s}$로 완벽한 무반동 직립 회복.
+
+   ![Gen 4 Run 36 대칭 게이트 롤아웃](media/run36_1900.gif)
 5. **Eureka Gen 5 (Run 37) — 지면 추진 구간(Ground Push) 관절 대칭성 게이트 완성**:
    - 미세 텔레메트리 심층 분석 결과, 양발이 지면에 닿아 있는 동안(Step 0~10)은 $\Delta z_{\text{feet}} \equiv 0$이어서 높이 기반 게이트가 작동하지 않는 맹점 발견.
    - `jump_crouch_reward`에 무릎/발목 굴곡 대칭 게이트($\exp(-|q_L + q_R|^2 / 0.12^2)$) 적용.
@@ -1950,7 +1962,13 @@ Run 13의 탐색 절벽 실패를 극복하고, 검증된 Run 12 체크포인트
    ```
 4. **배포 및 검증 (`scratch/record_jump_rollout.py`)**:
    - `scratch/jump_run41_1550.onnx`를 `policies/jump.onnx`로 배포.
-   - 75스텝(1.5초) 물리 시뮬레이션 롤아웃 렌더링 (`scratch/run41_1550.gif`).
+   - 75스텝(1.5초) 물리 시뮬레이션 롤아웃 렌더링 (`scratch/run41_1550.gif` → `docs/media/run41_1550.gif`).
+
+   ![Run 41 6.7cm 최고 고도 점프 롤아웃](media/run41_1550.gif)
+
+   | ![1단계: 웅크리기](media/run41_frame_05.png) | ![2단계: 폭발적 추진](media/run41_frame_10.png) | ![3단계: 6.7cm 최고 체공](media/run41_frame_15.png) | ![4단계: 착지 자세 복원](media/run41_frame_30.png) | ![5단계: 무반동 기립](media/run41_frame_50.png) |
+   | :---: | :---: | :---: | :---: | :---: |
+   | Step 5 ($t=0.12$s)<br>$Z = 81.1\,\text{mm}$ | Step 10 ($t=0.22$s)<br>$V_z = +0.59\,\text{m/s}$ | Step 15 ($t=0.32$s)<br>**Left: $67.3\,\text{mm}$**, Apex: $147.1\,\text{mm}$ | Step 30 ($t=0.62$s)<br>Pitch: $+1.7^\circ$ | Step 50 ($t=1.02$s)<br>**Pitch: $+0.1^\circ$, $V_z=0$** |
 
 **막힌 것** — 증상 → 원인 → 해결
 
