@@ -293,7 +293,7 @@ class PolicyInference:
                  sitstand_onnx_path=None,
                  kick_left_onnx_path=None, kick_right_onnx_path=None,
                  roulade_onnx_path=None, jump_onnx_path=None,
-                 kick_duration=3.0, roulade_duration=2.0, jump_duration=0.55):
+                 kick_duration=3.0, roulade_duration=2.0, jump_duration=0.48):
         self.bam_ctrl = bam_ctrl  # bam.mujoco.MujocoController (None = legacy position actuators)
         self.model = model
         self.data = data
@@ -409,7 +409,9 @@ class PolicyInference:
                     f"--{name.replace('_', '-')} policies use the unified 13D "
                     "command obs (61D); run with --new-cmd-obs"
                 )
-            print(f"\nLoading {name} policy from: {path}")
+            import os, datetime
+            mtime = datetime.datetime.fromtimestamp(os.path.getmtime(path)).strftime('%Y-%m-%d %H:%M:%S')
+            print(f"\nLoading {name} policy from: {path} (Updated: {mtime})")
             self.behavior_sessions[name] = ort.InferenceSession(path)
             self.behavior_durations[name] = duration
             print(f"{name} policy input shape: {self.behavior_sessions[name].get_inputs()[0].shape}"
@@ -986,7 +988,7 @@ def main():
     parser.add_argument("--jump", type=str, default=None, help="Path to jump policy ONNX (press J to trigger). Requires --new-cmd-obs.")
     parser.add_argument("--kick-duration", type=float, default=3.0, help="Seconds a kick policy stays active before handing back to standing/walking (default: 3.0)")
     parser.add_argument("--roulade-duration", type=float, default=2.0, help="Seconds the roulade policy stays active before handing back to standing/walking (default: 2.0, ~the roll itself; the standing/walking policy takes over for the settle)")
-    parser.add_argument("--jump-duration", type=float, default=0.55, help="Seconds the jump policy stays active before handing back to standing/walking (default: 0.55, ~deep jump and landing; the standing policy takes over for the rest)")
+    parser.add_argument("--jump-duration", type=float, default=0.48, help="Seconds the jump policy stays active before handing back to standing/walking (default: 0.48, ~crouch, explosive jump and landing; standing policy takes over immediately)")
     parser.add_argument("--lin-vel-x", type=float, default=0.0, help="Initial linear velocity X command (m/s)")
     parser.add_argument("--lin-vel-y", type=float, default=0.0, help="Initial linear velocity Y command (m/s)")
     parser.add_argument("--ang-vel-z", type=float, default=0.0, help="Initial angular velocity Z command (rad/s)")
@@ -1466,8 +1468,17 @@ def main():
             try:
                 import ctypes
                 hwnd = ctypes.windll.user32.FindWindowW("GLFW30", None)
+                if not hwnd:
+                    hwnd = ctypes.windll.user32.FindWindowW(None, "MuJoCo : scene")
                 if hwnd:
                     ctypes.windll.user32.ShowWindow(hwnd, 5)  # SW_SHOW
+                    # Force window to absolute foreground
+                    SWP_NOMOVE = 0x0002
+                    SWP_NOSIZE = 0x0001
+                    HWND_TOPMOST = -1
+                    HWND_NOTOPMOST = -2
+                    ctypes.windll.user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE)
+                    ctypes.windll.user32.SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE)
                     ctypes.windll.user32.SetForegroundWindow(hwnd)
             except Exception:
                 pass
