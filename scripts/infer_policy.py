@@ -293,7 +293,7 @@ class PolicyInference:
                  sitstand_onnx_path=None,
                  kick_left_onnx_path=None, kick_right_onnx_path=None,
                  roulade_onnx_path=None, jump_onnx_path=None,
-                 kick_duration=3.0, roulade_duration=2.0, jump_duration=0.48):
+                 kick_duration=3.0, roulade_duration=2.0, jump_duration=0.60):
         self.bam_ctrl = bam_ctrl  # bam.mujoco.MujocoController (None = legacy position actuators)
         self.model = model
         self.data = data
@@ -988,7 +988,7 @@ def main():
     parser.add_argument("--jump", type=str, default=None, help="Path to jump policy ONNX (press J to trigger). Requires --new-cmd-obs.")
     parser.add_argument("--kick-duration", type=float, default=3.0, help="Seconds a kick policy stays active before handing back to standing/walking (default: 3.0)")
     parser.add_argument("--roulade-duration", type=float, default=2.0, help="Seconds the roulade policy stays active before handing back to standing/walking (default: 2.0, ~the roll itself; the standing/walking policy takes over for the settle)")
-    parser.add_argument("--jump-duration", type=float, default=0.48, help="Seconds the jump policy stays active before handing back to standing/walking (default: 0.48, ~crouch, explosive jump and landing; standing policy takes over immediately)")
+    parser.add_argument("--jump-duration", type=float, default=0.60, help="Seconds the jump policy stays active before handing back to standing/walking (default: 0.60, ~crouch, explosive jump, landing cushion and recovery; standing policy takes over immediately)")
     parser.add_argument("--lin-vel-x", type=float, default=0.0, help="Initial linear velocity X command (m/s)")
     parser.add_argument("--lin-vel-y", type=float, default=0.0, help="Initial linear velocity Y command (m/s)")
     parser.add_argument("--ang-vel-z", type=float, default=0.0, help="Initial angular velocity Z command (rad/s)")

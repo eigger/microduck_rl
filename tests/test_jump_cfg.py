@@ -12,7 +12,7 @@ def test_jump_task_registered():
 
 def test_jump_cfg_builds():
     cfg = make_microduck_jump_env_cfg()
-    assert cfg.episode_length_s == 1.0
+    assert cfg.episode_length_s == 1.2
     assert cfg.sim.dt == 0.005
     assert cfg.sim.decimation == 4
 
@@ -32,6 +32,7 @@ def test_jump_rewards_present_and_signs():
     # Self-negating penalty (returns <= 0, positive weight)
     assert "leg_symmetry" in r and r["leg_symmetry"].weight > 0
     assert "knee_hyperextension" in r and r["knee_hyperextension"].weight > 0
+    assert "jump_sagittal_foot" in r and r["jump_sagittal_foot"].weight > 0
 
 
     # Negative regularizers

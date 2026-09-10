@@ -7295,25 +7295,23 @@ def jump_flight_reward(
     env: ManagerBasedRlEnv,
     sensor_name: str = "feet_ground_contact",
     stand_z: float = STAND_Z,
-    target_height: float = 0.230,
+    target_height: float = 0.190,
     min_clearance: float = 0.010,
-    target_clearance: float = 0.120,
+    target_clearance: float = 0.080,
     min_step: int = 10,
-    max_step: int = 32,
-    min_crouch_z: float = 0.082,
-    full_crouch_z: float = 0.060,
+    max_step: int = 26,
+    min_crouch_z: float = 0.088,
+    full_crouch_z: float = 0.070,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Phase 3: Absolute jump height reward (Gen 9 — running-max design).
+    """Phase 3: Absolute jump height and apex clearance (Gen 10 — Anti-Cheat Design).
 
-    KEY CHANGE: height_score uses the running MAXIMUM trunk Z of the episode,
-    measured ABOVE standing height (stand_z). This means:
-      - Squatting alone scores 0 (max_z stays at or below stand_z)
-      - The policy MUST push the trunk above standing height to earn height reward
-      - height_score = (max_z - stand_z) / (target_height - stand_z), zero-floor
-
-    clearance_score uses instantaneous min foot clearance (additive, independent gradient).
-    Both components gated by: active * both_in_air * upright * crouch_gate.
+    Key Anti-Cheating Invariants:
+    1. height_score strictly requires trunk Z > stand_z (zero when trunk <= stand_z).
+    2. clearance_score is MULTIPLICATIVELY LINKED: height_score * (1.0 + 0.5 * clearance_score).
+       If the trunk is not elevated above standing height, reward is ZERO.
+       No cheating by kicking feet forward or doing scissor kicks near the ground!
+    3. Bilateral clearance rewards pulling feet away from ground at the apex.
     """
     asset: Entity = env.scene[asset_cfg.name]
     sensor = env.scene[sensor_name]
@@ -7331,16 +7329,15 @@ def jump_flight_reward(
     cos_tilt = 1.0 - 2.0 * (quat[:, 1] ** 2 + quat[:, 2] ** 2)
     upright = torch.clamp(cos_tilt, min=0.0)
 
-    # Running-max height score: 0 at standing, positive only when trunk above stand_z
+    # Trunk height score above standing (instantaneous at airborne steps)
     z = torch.nan_to_num(asset.data.root_link_pos_w[:, 2], nan=0.0)
     max_z = _update_jump_max_trunk_z(env, asset)
     height_score = torch.clamp(
-        (max_z - stand_z) / max(1e-4, target_height - stand_z),
+        (z - stand_z) / max(1e-4, target_height - stand_z),
         min=0.0,
         max=2.0,
     )
 
-    # Clearance score: instantaneous bilateral foot clearance (additive)
     if not hasattr(env, "_foot_site_ids"):
         env._foot_site_ids = [
             asset.site_names.index("left_foot"),
@@ -7360,26 +7357,26 @@ def jump_flight_reward(
     env.extras["log"]["Metrics/jump_peak_z"] = torch.mean(max_z)  # running max (true apex)
     env.extras["log"]["Metrics/min_foot_clearance_mm"] = torch.mean(clearance * 1000.0)
 
-    return gates * (height_score + clearance_score)
+    # Multiplicative linkage: clearance bonus only amplifies real trunk elevation
+    return gates * height_score * (1.0 + 0.5 * clearance_score)
 
 
 def jump_aerial_tuck_reward(
     env: ManagerBasedRlEnv,
     sensor_name: str = "feet_ground_contact",
-    target_knee_flex: float = 1.20,
+    stand_z: float = STAND_Z,
+    target_knee_flex: float = 1.10,
     min_step: int = 10,
-    max_step: int = 32,
-    min_crouch_z: float = 0.082,
-    full_crouch_z: float = 0.060,
+    max_step: int = 26,
+    min_crouch_z: float = 0.088,
+    full_crouch_z: float = 0.070,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Dedicated aerial knee tuck reward: rewards deep bilateral knee flexion while airborne.
+    """Dedicated aerial knee tuck reward: rewards bilateral knee flexion while airborne.
 
-    Completely decoupled from the height*clearance multiplicative product in jump_flight_reward,
-    so the policy receives a clean gradient for tucking knees regardless of apex height.
-    This prevents the multiplicative collapse where a small height_score zeroes out the tuck signal.
-
-    Returns tuck_score in [0, 1] scaled to target_knee_flex (default 1.2 rad per leg).
+    Requires trunk to be ACTUALLY above standing height (z > stand_z) so the robot cannot
+    earn tuck reward while sitting, hovering, or falling near the ground.
+    Enforces forward knee flexion convention (left knee >= 0, right knee <= 0).
     """
     asset: Entity = env.scene[asset_cfg.name]
     sensor = env.scene[sensor_name]
@@ -7395,11 +7392,44 @@ def jump_aerial_tuck_reward(
     contacts = sensor.data.found
     both_in_air = (torch.sum(contacts, dim=-1) == 0).float()
 
+    # Must be above standing height to earn aerial tuck!
+    z = torch.nan_to_num(asset.data.root_link_pos_w[:, 2], nan=0.0)
+    in_air_gate = torch.clamp((z - stand_z) / 0.015, min=0.0, max=1.0)
+
     joint_pos = _servo_joint_pos(env, asset)
-    knee_flex = 0.5 * (torch.abs(joint_pos[:, 3]) + torch.abs(joint_pos[:, 12]))
+    # Forward knee flexion: left is positive, right is negative
+    lk_flex = torch.clamp(joint_pos[:, 3], min=0.0)
+    rk_flex = torch.clamp(-joint_pos[:, 12], min=0.0)
+    knee_flex = 0.5 * (lk_flex + rk_flex)
     tuck_score = torch.clamp(knee_flex / target_knee_flex, min=0.0, max=1.0)
 
-    return active * both_in_air * crouch_gate * tuck_score
+    return active * both_in_air * crouch_gate * in_air_gate * tuck_score
+
+
+def jump_sagittal_foot_penalty(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Penalize kicking feet forward/backward (sagittal deviation) and scissor splits.
+
+    Keeps feet directly underneath the trunk during crouching, takeoff, and landing.
+    Returns <= 0 (self-negating penalty); use with positive weight.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    if not hasattr(env, "_foot_site_ids"):
+        env._foot_site_ids = [
+            asset.site_names.index("left_foot"),
+            asset.site_names.index("right_foot"),
+        ]
+    feet_x = asset.data.site_pos_w[:, env._foot_site_ids, 0]
+    trunk_x = asset.data.root_link_pos_w[:, 0:1]
+    rel_x = feet_x - trunk_x  # forward offset in world x
+    # Forward kick penalty: rel_x > 0.025m (kick forward) or < -0.04m (kick backward)
+    fwd_cheat = torch.clamp(rel_x - 0.025, min=0.0)
+    back_cheat = torch.clamp(-0.040 - rel_x, min=0.0)
+    # Scissor cheat: difference between left and right foot x
+    scissor = torch.abs(rel_x[:, 0] - rel_x[:, 1])
+    return -(torch.sum(fwd_cheat * 2.0 + back_cheat, dim=-1) + scissor * 3.0)
 
 
 def jump_landing_cushion_reward(
