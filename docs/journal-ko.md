@@ -20,6 +20,7 @@
 | **2026-09-07** | **Mac mini 환경 구축 & CPU 분산 학습** | • Ray 기반 멀티워커 CPU 분산 학습 환경 검증<br>• MJCF 씬 로딩 및 duck-body 시뮬레이터 검증 | [2026-09-07.md](journal/2026-09-07.md) |
 | **2026-09-08** | **Windows 환경 구축 & 점프(CMJ) 기초 (Run 1~21)** | • RTX 5060 GPU 가속(cu128) 및 4096-env 학습 성공<br>• 5단계 카운터무브먼트 점프(CMJ) 프레임워크 수립<br>• 개구리 다리 찢기/과신전/바닥 체류 보상 해킹 규명 및 박멸 | [2026-09-08.md](journal/2026-09-08.md) |
 | **2026-09-09** | **지속시간 버그 정상화 & 최고 고도(6.7cm) 달성** | • 1.0s 경계 전복 버그 규명 및 0.48s 전환 정상화<br>• Eureka 진화 기법 적용 및 대칭 과적용 부작용 분석<br>• Height-First 보상(Run 41)으로 **실측 6.7cm 체공 & 착지 0.1° 완벽 기립** 달성 | [2026-09-09.md](journal/2026-09-09.md) |
+| **2026-09-10** | **Eureka Gen 6→9: 보상 구조 재설계 (Run 42~45)** | • 곱셈 붕괴 → 가산 구조 → Running-max 절대 높이 순차 개선<br>• **Gen 9 신기록: `jump_peak_z=0.190m` (+7.3cm above standing)** ✅<br>• `policies/jump_gen9_3200.onnx` export 완료 | [2026-09-10.md](journal/2026-09-10.md) |
 
 ---
 
@@ -78,3 +79,11 @@
 - 점프 높이 극대화 및 공중 무릎 접기(Tuck) 분석, 5.4cm 실측 최고 높이 정책(Run 26) 배포
 - Eureka 기법 기반 점프 보상 함수 반복 최적화 (Gen 1~5) 및 웅크림/도약 지면 추진 대칭성 게이트 확립
 - 대칭성 과도 규제로 인한 점프 높이 회귀(5.4→3.2cm) 원인 규명 및 Height-First 보상 전면 복원 (Run 41, 6.7cm 달성)
+
+### [2026-09-10 — Eureka Gen 6/7: 스쿼트 심화 + 독립 Tuck 보상 분리 (Run 42/43)](journal/2026-09-10.md)
+- Run 41(6.7cm) 베이스라인에서 10cm+ 목표로 풀 파라미터 패키지 적용 (Gen 6)
+- 스모크 테스트에서 `min_knee_flexion=1.05` 초기 gate 막힘 발견 → 0.90으로 완화
+- Run 42: `jump_flight=30` 달성했으나 `min_foot_clearance_mm` 13mm에서 완전 정체
+- `target_vz` 1.6→1.1 수정해도 정체 지속 — Vz 문제가 아닌 보상 구조 문제로 재진단
+- **곱셈 붕괴(height_score≈0 → tuck gradient 소멸) 원인 규명**: `min_flight_z=0.118`이 서있는 높이와 동일
+- `jump_aerial_tuck_reward` 독립 함수 신설(weight 100) + `min_flight_z` 0.118→0.100 + `tuck_mult` max 1.5x→2.5x (Gen 7, Run 43 학습 중)

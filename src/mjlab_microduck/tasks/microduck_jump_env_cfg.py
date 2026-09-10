@@ -38,7 +38,7 @@ from mjlab_microduck.tasks.microduck_velocity_env_cfg import HEAD_BODY_NAMES
 from mjlab_microduck.tasks.symmetry import PpoWithSymmetryCfg, SYMMETRY_CFG
 
 NUM_STEPS_PER_ENV = 24
-EPISODE_LENGTH_S = 1.0
+EPISODE_LENGTH_S = 1.2
 
 ENABLE_SYMMETRY = True
 ENABLE_COM_RANDOMIZATION = True
@@ -118,53 +118,70 @@ def make_microduck_jump_env_cfg(play: bool = False, rough: bool = False) -> Mana
         if term in cfg.rewards:
             del cfg.rewards[term]
 
-    # Jump-specific reward stack (Eureka Gen 2: Natural CMJ Resonance + Multiplicative Clearance)
-    # Phase 1: Deep preparatory crouch/squat (steps 0-10, t in 0.00-0.20s)
+    # Jump-specific reward stack (Eureka Gen 6: Height-First 10cm+ target)
+    # Phase 1: Deep preparatory crouch/squat (steps 0-12, t in 0.00-0.24s)
+    # Deeper squat target (55mm) + stronger knee flexion (1.05 rad) for more elastic energy
     cfg.rewards["jump_crouch"] = RewardTermCfg(
         func=microduck_mdp.jump_crouch_reward,
-        weight=120.0,
+        weight=150.0,
         params={
             "sensor_name": "feet_ground_contact",
-            "target_z": 0.063,
+            "target_z": 0.055,
             "std_z": 0.012,
-            "max_step": 10,
-            "min_knee_flexion": 0.85,
+            "max_step": 12,
+            "min_knee_flexion": 0.90,
         },
     )
 
-    # Phase 2: Explosive takeoff upward thrust (steps 8-16, t in 0.16-0.32s)
-    # Pure quadratic reward on Vz up to 1.25+ m/s with massive 250.0 weight
+    # Phase 2: Explosive takeoff upward thrust (steps 8-18, t in 0.16-0.36s)
+    # target_vz 1.1 m/s: Run41 실측 0.59 m/s 대비 점진적 목표 (1.6은 gradient 희박)
+    # 이륙 윈도우 step 8~18로 넓혀 학습 기회 확보
     cfg.rewards["jump_takeoff_vz"] = RewardTermCfg(
         func=microduck_mdp.jump_takeoff_velocity_reward,
-        weight=250.0,
+        weight=300.0,
         params={
-            "target_vz": 1.25,
+            "target_vz": 1.1,
             "min_step": 8,
-            "max_step": 16,
-            "min_crouch_z": 0.088,
-            "full_crouch_z": 0.065,
+            "max_step": 18,
+            "min_crouch_z": 0.082,
+            "full_crouch_z": 0.060,
         },
     )
 
-    # Phase 3: High airborne flight and apex clearance (steps 10-26, t in 0.20-0.52s)
-    # Dominant reward on bilateral clearance + apex height with 350.0 weight
+    # Phase 3: Absolute jump height reward (Gen 9 — running-max above standing height)
+    # height_score = (max_z - 0.117) / (0.230 - 0.117): 0 when not jumped, drives real apex
     cfg.rewards["jump_flight"] = RewardTermCfg(
         func=microduck_mdp.jump_flight_reward,
-        weight=350.0,
+        weight=450.0,
         params={
             "sensor_name": "feet_ground_contact",
-            "min_flight_z": 0.118,
-            "target_height": 0.180,
+            "stand_z": 0.117,
+            "target_height": 0.230,
             "min_clearance": 0.010,
-            "target_clearance": 0.080,
-            "min_step": 10,
-            "max_step": 26,
-            "min_crouch_z": 0.088,
-            "full_crouch_z": 0.065,
+            "target_clearance": 0.120,
+            "min_step": 12,
+            "max_step": 32,
+            "min_crouch_z": 0.082,
+            "full_crouch_z": 0.060,
         },
     )
 
-    # Phase 4 & 5: Landing terms minimized to near-zero as user instructed: '착지는 그다음에 개선해보고'
+    # Phase 3b: Dedicated aerial knee tuck (decoupled from multiplicative flight composite)
+    # Clean gradient for tucking knees regardless of apex height — prevents multiplicative collapse
+    cfg.rewards["jump_aerial_tuck"] = RewardTermCfg(
+        func=microduck_mdp.jump_aerial_tuck_reward,
+        weight=100.0,
+        params={
+            "sensor_name": "feet_ground_contact",
+            "target_knee_flex": 1.20,
+            "min_step": 10,
+            "max_step": 32,
+            "min_crouch_z": 0.082,
+            "full_crouch_z": 0.060,
+        },
+    )
+
+    # Phase 4 & 5: Landing terms minimized to near-zero (focus is on height)
     cfg.rewards["jump_landing_cushion"] = RewardTermCfg(
         func=microduck_mdp.jump_landing_cushion_reward,
         weight=0.001,
@@ -172,8 +189,8 @@ def make_microduck_jump_env_cfg(play: bool = False, rough: bool = False) -> Mana
             "sensor_name": "feet_ground_contact",
             "min_air_time": 0.04,
             "min_knee_flexion": 0.25,
-            "min_step": 24,
-            "max_step": 36,
+            "min_step": 30,
+            "max_step": 42,
         },
     )
 
@@ -184,7 +201,7 @@ def make_microduck_jump_env_cfg(play: bool = False, rough: bool = False) -> Mana
             "target_z": 0.117,
             "std_z": 0.018,
             "std_pose": 0.25,
-            "min_step": 32,
+            "min_step": 38,
         },
     )
 
@@ -235,8 +252,8 @@ def make_microduck_jump_env_cfg(play: bool = False, rough: bool = False) -> Mana
     cfg.rewards["body_ang_vel"].weight = -0.01
     cfg.rewards["angular_momentum"].weight = -0.005
 
-    # Action smoothness (allow explosive torque rate during launch)
-    cfg.rewards["action_rate_l2"].weight = -0.01
+    # Action smoothness: 10x stronger to prevent action_std explosion (Gen 8 hit std=27)
+    cfg.rewards["action_rate_l2"].weight = -0.1
 
     # ── Terminations ──────────────────────────────────────────────────────────
     cfg.terminations["time_out"].time_out = True
@@ -474,6 +491,6 @@ MicroduckJumpRlCfg = RslRlOnPolicyRunnerCfg(
     run_name="jump",
     save_interval=50,
     num_steps_per_env=NUM_STEPS_PER_ENV,
-    max_iterations=1500,
+    max_iterations=2000,
 )
 

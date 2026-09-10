@@ -7277,51 +7277,70 @@ def jump_takeoff_velocity_reward(
     return active * upright * vz_score * crouch_gate
 
 
+STAND_Z = 0.117  # trunk height at nominal standing pose (measured from sim)
+
+
+def _update_jump_max_trunk_z(env: ManagerBasedRlEnv, asset: Entity) -> torch.Tensor:
+    """Track running MAXIMUM trunk Z within each episode for absolute jump height reward."""
+    z = torch.nan_to_num(asset.data.root_link_pos_w[:, 2], nan=STAND_Z)
+    if not hasattr(env, "_max_trunk_z") or env._max_trunk_z.shape[0] != z.shape[0]:
+        env._max_trunk_z = z.clone()
+    resets = (env.episode_length_buf == 0)
+    env._max_trunk_z[resets] = z[resets]
+    env._max_trunk_z = torch.maximum(env._max_trunk_z, z)
+    return env._max_trunk_z
+
+
 def jump_flight_reward(
     env: ManagerBasedRlEnv,
     sensor_name: str = "feet_ground_contact",
-    min_flight_z: float = 0.118,
-    target_height: float = 0.180,
+    stand_z: float = STAND_Z,
+    target_height: float = 0.230,
     min_clearance: float = 0.010,
-    target_clearance: float = 0.080,
+    target_clearance: float = 0.120,
     min_step: int = 10,
-    max_step: int = 26,
-    min_crouch_z: float = 0.088,
-    full_crouch_z: float = 0.065,
+    max_step: int = 32,
+    min_crouch_z: float = 0.082,
+    full_crouch_z: float = 0.060,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Phase 3: High airborne flight and apex clearance (t in 0.20s - 0.52s, steps 10-26).
-    
-    Pure maximum clearance and height reward:
-    1. Hard crouch gate (must have squatted deep before flight).
-    2. BOTH feet off ground (both_in_air == 1).
-    3. Trunk height score (up to 180mm).
-    4. Bilateral foot clearance score (targeting 80mm clearance).
-    5. Aerial knee tuck reward: actively encourages bending knees (> 1.1 rad) while in the air to pull feet up!
+    """Phase 3: Absolute jump height reward (Gen 9 — running-max design).
+
+    KEY CHANGE: height_score uses the running MAXIMUM trunk Z of the episode,
+    measured ABOVE standing height (stand_z). This means:
+      - Squatting alone scores 0 (max_z stays at or below stand_z)
+      - The policy MUST push the trunk above standing height to earn height reward
+      - height_score = (max_z - stand_z) / (target_height - stand_z), zero-floor
+
+    clearance_score uses instantaneous min foot clearance (additive, independent gradient).
+    Both components gated by: active * both_in_air * upright * crouch_gate.
     """
     asset: Entity = env.scene[asset_cfg.name]
     sensor = env.scene[sensor_name]
-    
+
     step_count = env.episode_length_buf
     active = ((step_count >= min_step) & (step_count <= max_step)).float()
-    
+
     min_z = _update_jump_min_trunk_z(env, asset)
     crouch_gate = torch.clamp((min_crouch_z - min_z) / (min_crouch_z - full_crouch_z), min=0.0, max=1.0)
-    
+
     contacts = sensor.data.found
     both_in_air = (torch.sum(contacts, dim=-1) == 0).float()
-    
+
     quat = asset.data.root_link_quat_w
     cos_tilt = 1.0 - 2.0 * (quat[:, 1] ** 2 + quat[:, 2] ** 2)
     upright = torch.clamp(cos_tilt, min=0.0)
-    
+
+    # Running-max height score: 0 at standing, positive only when trunk above stand_z
     z = torch.nan_to_num(asset.data.root_link_pos_w[:, 2], nan=0.0)
+    max_z = _update_jump_max_trunk_z(env, asset)
     height_score = torch.clamp(
-        (z - min_flight_z) / max(1e-4, target_height - min_flight_z),
+        (max_z - stand_z) / max(1e-4, target_height - stand_z),
         min=0.0,
         max=2.0,
     )
-    
+
+    # Clearance score: instantaneous bilateral foot clearance (additive)
     if not hasattr(env, "_foot_site_ids"):
         env._foot_site_ids = [
             asset.site_names.index("left_foot"),
@@ -7335,17 +7354,52 @@ def jump_flight_reward(
         min=0.0,
         max=2.0,
     )
-    
-    # Aerial knee tuck bonus: rewards pulling feet up to chest while in the air
+
+    gates = active * both_in_air * upright * crouch_gate
+
+    env.extras["log"]["Metrics/jump_peak_z"] = torch.mean(max_z)  # running max (true apex)
+    env.extras["log"]["Metrics/min_foot_clearance_mm"] = torch.mean(clearance * 1000.0)
+
+    return gates * (height_score + clearance_score)
+
+
+def jump_aerial_tuck_reward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    target_knee_flex: float = 1.20,
+    min_step: int = 10,
+    max_step: int = 32,
+    min_crouch_z: float = 0.082,
+    full_crouch_z: float = 0.060,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Dedicated aerial knee tuck reward: rewards deep bilateral knee flexion while airborne.
+
+    Completely decoupled from the height*clearance multiplicative product in jump_flight_reward,
+    so the policy receives a clean gradient for tucking knees regardless of apex height.
+    This prevents the multiplicative collapse where a small height_score zeroes out the tuck signal.
+
+    Returns tuck_score in [0, 1] scaled to target_knee_flex (default 1.2 rad per leg).
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    sensor = env.scene[sensor_name]
+
+    step_count = env.episode_length_buf
+    active = ((step_count >= min_step) & (step_count <= max_step)).float()
+
+    min_z = _update_jump_min_trunk_z(env, asset)
+    crouch_gate = torch.clamp(
+        (min_crouch_z - min_z) / (min_crouch_z - full_crouch_z), min=0.0, max=1.0
+    )
+
+    contacts = sensor.data.found
+    both_in_air = (torch.sum(contacts, dim=-1) == 0).float()
+
     joint_pos = _servo_joint_pos(env, asset)
     knee_flex = 0.5 * (torch.abs(joint_pos[:, 3]) + torch.abs(joint_pos[:, 12]))
-    tuck_mult = 1.0 + 0.5 * torch.clamp(knee_flex / 1.10, min=0.0, max=1.0)
-    
-    env.extras["log"]["Metrics/jump_peak_z"] = torch.mean(z)
-    env.extras["log"]["Metrics/min_foot_clearance_mm"] = torch.mean(clearance * 1000.0)
-    
-    return active * both_in_air * upright * height_score * clearance_score * crouch_gate * tuck_mult
+    tuck_score = torch.clamp(knee_flex / target_knee_flex, min=0.0, max=1.0)
 
+    return active * both_in_air * crouch_gate * tuck_score
 
 
 def jump_landing_cushion_reward(
