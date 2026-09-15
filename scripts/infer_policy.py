@@ -293,7 +293,7 @@ class PolicyInference:
                  sitstand_onnx_path=None,
                  kick_left_onnx_path=None, kick_right_onnx_path=None,
                  roulade_onnx_path=None, jump_onnx_path=None,
-                 kick_duration=3.0, roulade_duration=2.0, jump_duration=0.60):
+                 kick_duration=3.0, roulade_duration=2.0, jump_duration=0.52):
         self.bam_ctrl = bam_ctrl  # bam.mujoco.MujocoController (None = legacy position actuators)
         self.model = model
         self.data = data
@@ -752,8 +752,18 @@ class PolicyInference:
         else:
             obs.append(self.get_raw_accelerometer())
 
-        obs.append(self.get_joint_pos_relative())
-        obs.append(self.get_joint_vel())
+        jpos_rel = self.get_joint_pos_relative()
+        jvel = self.get_joint_vel()
+        if self.current_policy == "jump":
+            # Jump was trained from HOME_FRAME with head locked neutral (head_neutral
+            # penalty -50, head_action_l2 -30). The settled standing neck tilt
+            # (-0.12 rad) is a ~12-sigma OOD outlier that saturates the policy's
+            # baked normalizer and suppresses leg extension thrust. Neutralize head slots:
+            jpos_rel[5:9] = 0.0
+            jvel[5:9] = 0.0
+
+        obs.append(jpos_rel)
+        obs.append(jvel)
         obs.append(self.last_action)
         obs.append(self.command)
 
@@ -837,6 +847,11 @@ class PolicyInference:
         self.vel_cmd = np.zeros(3, dtype=np.float32)
         self.current_policy = name
         self.ort_session = session
+        self.last_action[:] = 0.0
+        self._jump_action_lag = np.zeros(self.n_joints, dtype=np.float32)
+        if self.use_delay and self.action_buffer is not None:
+            for buf in self.action_buffer:
+                buf[:] = 0.0
         self._update_command()
         print(f"{name}: started (auto-return in {self.behavior_time_left:.1f}s)")
 
@@ -870,6 +885,11 @@ class PolicyInference:
         name = self.behavior_mode
         self.behavior_mode = None
         self.vel_cmd = np.zeros(3, dtype=np.float32)
+        self.last_action[:] = 0.0
+        self._jump_action_lag = np.zeros(self.n_joints, dtype=np.float32)
+        if self.use_delay and self.action_buffer is not None:
+            for buf in self.action_buffer:
+                buf[:] = 0.0
         if self.standing_session:
             self.current_policy = "standing"
             self.ort_session = self.standing_session
@@ -949,6 +969,12 @@ class PolicyInference:
             delayed_action = self.action_buffer[delayed_index]
             self.buffer_index = (self.buffer_index + 1) % len(self.action_buffer)
             target_positions = self.default_pose + delayed_action * self.action_scale
+        elif self.current_policy == "jump":
+            # BAM actuator in training models 15-30ms (1 step) bus latency.
+            # Without this, zero-latency sim thrust triggers premature reversal.
+            delayed_action = getattr(self, "_jump_action_lag", np.zeros_like(action))
+            self._jump_action_lag = action.copy()
+            target_positions = self.default_pose + delayed_action * self.action_scale
         else:
             target_positions = self.default_pose + action * self.action_scale
 
@@ -988,7 +1014,7 @@ def main():
     parser.add_argument("--jump", type=str, default=None, help="Path to jump policy ONNX (press J to trigger). Requires --new-cmd-obs.")
     parser.add_argument("--kick-duration", type=float, default=3.0, help="Seconds a kick policy stays active before handing back to standing/walking (default: 3.0)")
     parser.add_argument("--roulade-duration", type=float, default=2.0, help="Seconds the roulade policy stays active before handing back to standing/walking (default: 2.0, ~the roll itself; the standing/walking policy takes over for the settle)")
-    parser.add_argument("--jump-duration", type=float, default=0.60, help="Seconds the jump policy stays active before handing back to standing/walking (default: 0.60, ~crouch, explosive jump, landing cushion and recovery; standing policy takes over immediately)")
+    parser.add_argument("--jump-duration", type=float, default=0.52, help="Seconds the jump policy stays active before handing back to standing/walking (default: 0.52, crouch takeoff apex cushion; standing policy takes over to eliminate landing chatter)")
     parser.add_argument("--lin-vel-x", type=float, default=0.0, help="Initial linear velocity X command (m/s)")
     parser.add_argument("--lin-vel-y", type=float, default=0.0, help="Initial linear velocity Y command (m/s)")
     parser.add_argument("--ang-vel-z", type=float, default=0.0, help="Initial angular velocity Z command (rad/s)")
@@ -1512,7 +1538,7 @@ def main():
                 prev_step_time = step_start
 
                 policy.update_ground_pick_phase(actual_dt)
-                policy.update_behavior(actual_dt)
+                policy.update_behavior(control_dt)
 
                 if policy_enabled:
                     action = policy.infer()

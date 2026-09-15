@@ -38,7 +38,7 @@ from mjlab_microduck.tasks.microduck_velocity_env_cfg import HEAD_BODY_NAMES
 from mjlab_microduck.tasks.symmetry import PpoWithSymmetryCfg, SYMMETRY_CFG
 
 NUM_STEPS_PER_ENV = 24
-EPISODE_LENGTH_S = 1.2
+EPISODE_LENGTH_S = 1.2  # 60 steps (Two-Phase: 0-18 deep squat, 17-25 explosive thrust, 22-35 straight flight, 32-60 land & rest)
 
 ENABLE_SYMMETRY = True
 ENABLE_COM_RANDOMIZATION = True
@@ -118,122 +118,159 @@ def make_microduck_jump_env_cfg(play: bool = False, rough: bool = False) -> Mana
         if term in cfg.rewards:
             del cfg.rewards[term]
 
-    # Jump-specific reward stack (Eureka Gen 10: Anti-Cheat & Physical Apex)
-    # Phase 1: Preparatory crouch/squat (steps 0-10, t in 0.00-0.20s)
-    # Target 75mm (where servos maintain high mechanical torque ratio for takeoff)
-    cfg.rewards["jump_crouch"] = RewardTermCfg(
-        func=microduck_mdp.jump_crouch_reward,
-        weight=120.0,
+    # Two-Phase Vertical Jump Reward Stack (Run 78: Zero-Pitch Triple Extension Architecture):
+    # Phase 1: Slow, smooth, controlled deep squat down (steps 0-18, t in 0.00-0.36s)
+    # Direct joint pose matching (multiplicative composite): Knee +50.0°, Hip +36.1°, Ankle +21.8° guarantees 0° pitch!
+    cfg.rewards["jump_slewed_crouch"] = RewardTermCfg(
+        func=microduck_mdp.jump_slewed_crouch_reward,
+        weight=10.0,
         params={
             "sensor_name": "feet_ground_contact",
-            "target_z": 0.075,
-            "std_z": 0.012,
-            "max_step": 10,
-            "min_knee_flexion": 0.75,
+            "ramp_steps": 14,
+            "max_step": 18,
         },
     )
 
-    # Phase 2: Explosive takeoff upward thrust (steps 8-16, t in 0.16-0.32s)
-    cfg.rewards["jump_takeoff_vz"] = RewardTermCfg(
-        func=microduck_mdp.jump_takeoff_velocity_reward,
-        weight=250.0,
+    # Phase 1b: L1 bootstrap on squat pose: provides constant gradient toward deep squat
+    cfg.rewards["jump_slewed_crouch_l1"] = RewardTermCfg(
+        func=microduck_mdp.jump_slewed_crouch_l1_reward,
+        weight=3.0,
         params={
-            "target_vz": 1.05,
-            "min_step": 8,
-            "max_step": 16,
-            "min_crouch_z": 0.088,
-            "full_crouch_z": 0.070,
+            "ramp_steps": 14,
+            "max_step": 18,
         },
     )
 
-    # Phase 3: Absolute jump height & apex clearance (Gen 10 — Anti-Cheat)
-    # Multiplicatively linked: clearance bonus only amplifies real trunk elevation above standing height!
-    cfg.rewards["jump_flight"] = RewardTermCfg(
-        func=microduck_mdp.jump_flight_reward,
-        weight=200.0,
+    # Phase 1c: Anti-Early-Launch Penalty (steps 0-15, t in 0.00-0.30s)
+    # Self-negating penalty (<= 0): strictly forbids hopping/launching before squat is complete!
+    cfg.rewards["jump_early_launch"] = RewardTermCfg(
+        func=microduck_mdp.jump_early_launch_penalty,
+        weight=5.0,
+        params={"max_step": 15, "threshold_vz": 0.03},
+    )
+
+    # Phase 2: Symmetrical explosive upward thrust & Triple Extension (steps 16-27, t in 0.32-0.54s)
+    # Rewards upward launch velocity + Knee Extension + Ankle Push + Hip Posterior Extension for 0-Pitch CoM alignment!
+    cfg.rewards["jump_vertical_thrust"] = RewardTermCfg(
+        func=microduck_mdp.jump_vertical_thrust_reward,
+        weight=15.0,
+        params={
+            "target_vz": 0.60,
+            "min_step": 16,
+            "max_step": 27,
+        },
+    )
+
+    # Phase 2b: Symmetrical Takeoff Synchrony (steps 0-27, t in 0.00-0.54s)
+    # Self-negating penalty (<= 0): forces BOTH feet to push and lift off simultaneously!
+    cfg.rewards["foot_height_symmetry"] = RewardTermCfg(
+        func=microduck_mdp.foot_height_symmetry_penalty,
+        weight=4.0,
+        params={"max_step": 27},
+    )
+
+    # Phase 3: Straight-leg airborne flight (steps 22-38, t in 0.44-0.76s)
+    # CRITICAL: Rewards True Foot Lift-off with legs extended straight and parallel (no scissor split)!
+    cfg.rewards["jump_straight_flight"] = RewardTermCfg(
+        func=microduck_mdp.jump_straight_flight_reward,
+        weight=20.0,
         params={
             "sensor_name": "feet_ground_contact",
-            "stand_z": 0.117,
-            "target_height": 0.190,
-            "min_clearance": 0.010,
-            "target_clearance": 0.080,
-            "min_step": 10,
-            "max_step": 26,
-            "min_crouch_z": 0.088,
-            "full_crouch_z": 0.070,
+            "stand_z": 0.1175,
+            "target_height": 0.140,
+            "min_step": 22,
+            "max_step": 38,
         },
     )
 
-    # Phase 3b: Dedicated aerial knee tuck (gated on trunk elevation above standing height)
-    cfg.rewards["jump_aerial_tuck"] = RewardTermCfg(
-        func=microduck_mdp.jump_aerial_tuck_reward,
-        weight=60.0,
-        params={
-            "sensor_name": "feet_ground_contact",
-            "stand_z": 0.117,
-            "target_knee_flex": 1.10,
-            "min_step": 10,
-            "max_step": 26,
-            "min_crouch_z": 0.088,
-            "full_crouch_z": 0.070,
-        },
-    )
-
-    # Phase 4: Compliant touchdown & spring cushion (steps 22-34)
+    # Phase 4: Compliant touchdown & spring cushion (steps 32-42, t in 0.64-0.84s)
     cfg.rewards["jump_landing_cushion"] = RewardTermCfg(
         func=microduck_mdp.jump_landing_cushion_reward,
-        weight=30.0,
+        weight=2.0,
         params={
             "sensor_name": "feet_ground_contact",
-            "min_air_time": 0.04,
-            "min_knee_flexion": 0.25,
-            "min_step": 22,
-            "max_step": 34,
+            "min_air_time": 0.03,
+            "min_knee_flexion": 0.15,
+            "min_step": 32,
+            "max_step": 42,
         },
     )
 
-    # Phase 5: Smooth return to upright standing rest pose (steps 32-60)
+    # Phase 5: Return to proud upright standing pose (steps 36-60, t in 0.72-1.20s)
+    # Restores standard symmetrical standing pose without drift or splay after touchdown!
     cfg.rewards["jump_landing_rest"] = RewardTermCfg(
         func=microduck_mdp.jump_landing_rest_reward,
-        weight=60.0,
+        weight=5.0,
         params={
+            "sensor_name": "feet_ground_contact",
+            "min_air_time": 0.03,
             "target_z": 0.117,
-            "std_z": 0.018,
+            "std_z": 0.015,
             "std_pose": 0.25,
-            "min_step": 32,
+            "min_step": 36,
         },
     )
 
-    # Upright orientation maintenance (std 30° keeps body upright during thrust)
+    # Upright orientation maintenance (std 10° keeps body upright during entire sequence)
     cfg.rewards["upright"].params["asset_cfg"].body_names = ("trunk_base",)
-    cfg.rewards["upright"].params["std"] = math.radians(30.0)
-    cfg.rewards["upright"].weight = 6.0
+    cfg.rewards["upright"].params["std"] = math.radians(10.0)
+    cfg.rewards["upright"].weight = 4.0
 
-    # Strict bilateral symmetry to prevent scissor splits (left forward, right back)
-    cfg.rewards["leg_symmetry"] = RewardTermCfg(
-        func=microduck_mdp.bilateral_symmetry_penalty,
-        weight=10.0,
-        params={"left_indices": [0, 1, 2, 3, 4], "right_indices": [9, 10, 11, 12, 13]},
+    # Strict roll tilt penalty: eliminates sideways lean during takeoff & flight
+    cfg.rewards["jump_roll_tilt"] = RewardTermCfg(
+        func=microduck_mdp.jump_roll_tilt_penalty,
+        weight=-4.0,
     )
-    # Anti-forward/backward foot kicking and anti-scissor penalty
-    cfg.rewards["jump_sagittal_foot"] = RewardTermCfg(
-        func=microduck_mdp.jump_sagittal_foot_penalty,
-        weight=10.0,
+
+    # Normalized yaw penalty: balanced gradient (-1.0) that guides heading without tax-bombing jump
+    cfg.rewards["jump_yaw"] = RewardTermCfg(
+        func=microduck_mdp.jump_yaw_penalty,
+        weight=-1.0,
     )
-    # Anti-split: gentle boundary preventing extreme hip spread
-    cfg.rewards["hip_lateral_spread"] = RewardTermCfg(
-        func=microduck_mdp.hip_lateral_abduction_penalty,
-        weight=-5.0,
-    )
-    # Head neutral: gentle boundary allowing dynamic neck compensation
-    cfg.rewards["head_neutral"] = RewardTermCfg(
-        func=microduck_mdp.head_neutral_penalty,
+
+    # Lateral drift penalty: prevents sideways velocity & displacement
+    cfg.rewards["jump_lateral_drift"] = RewardTermCfg(
+        func=microduck_mdp.jump_lateral_drift_penalty,
         weight=-2.0,
     )
-    # Drift penalty: gentle boundary keeping jump vertical without killing thrust
+
+    # Sagittal (forward) drift penalty: prevents leaping forward, enforces in-place vertical jump
+    cfg.rewards["jump_sagittal_drift"] = RewardTermCfg(
+        func=microduck_mdp.jump_sagittal_drift_penalty,
+        weight=-2.0,
+    )
+
+    # Lateral foot rail penalty: forces feet to stay on the +/- 42mm nominal rails
+    cfg.rewards["feet_lateral_rail"] = RewardTermCfg(
+        func=microduck_mdp.feet_lateral_rail_penalty,
+        weight=-2.0,
+    )
+
+    # Anti-split sideways: prevents lateral leg spreading (hip_roll)
+    cfg.rewards["hip_lateral_spread"] = RewardTermCfg(
+        func=microduck_mdp.hip_lateral_abduction_penalty,
+        weight=-2.0,
+    )
+
+    # Hip yaw neutral: strictly locks left/right hip_yaw to 0 to prevent torque generation around Z
+    cfg.rewards["hip_yaw_neutral"] = RewardTermCfg(
+        func=microduck_mdp.hip_yaw_neutral_penalty,
+        weight=-2.0,
+    )
+    # Head neutral: guides head posture without crushing dynamic jump
+    cfg.rewards["head_neutral"] = RewardTermCfg(
+        func=microduck_mdp.head_neutral_penalty,
+        weight=-5.0,
+    )
+    # Head action freeze: keeps head actions calm
+    cfg.rewards["head_action_l2"] = RewardTermCfg(
+        func=microduck_mdp.head_action_l2,
+        weight=-5.0,
+    )
+    # Drift penalty: keeps jump vertical
     cfg.rewards["jump_drift"] = RewardTermCfg(
         func=microduck_mdp.jump_drift_penalty,
-        weight=-5.0,
+        weight=-3.0,
     )
     # Anti-hyperextension: gentle barrier against knees bending backward
     cfg.rewards["knee_hyperextension"] = RewardTermCfg(
@@ -243,7 +280,7 @@ def make_microduck_jump_env_cfg(play: bool = False, rough: bool = False) -> Mana
 
     cfg.rewards["soft_landing"] = RewardTermCfg(
         func=mdp.soft_landing,
-        weight=-0.0001,
+        weight=-0.001,
         params={"sensor_name": feet_ground_cfg.name},
     )
     cfg.rewards["self_collisions"] = RewardTermCfg(
@@ -251,13 +288,13 @@ def make_microduck_jump_env_cfg(play: bool = False, rough: bool = False) -> Mana
         weight=-1.0,
         params={"sensor_name": self_collision_cfg.name},
     )
-    cfg.rewards["dof_pos_limits"].weight = -0.05
+    cfg.rewards["dof_pos_limits"].weight = -0.5
     cfg.rewards["body_ang_vel"].params["asset_cfg"].body_names = ("trunk_base",)
-    cfg.rewards["body_ang_vel"].weight = -0.01
-    cfg.rewards["angular_momentum"].weight = -0.005
+    cfg.rewards["body_ang_vel"].weight = -0.05
+    cfg.rewards["angular_momentum"].weight = -0.01
 
-    # Action smoothness: strong penalty to prevent action_std explosion
-    cfg.rewards["action_rate_l2"].weight = -0.5
+    # Action smoothness: Run 12 level action rate penalty
+    cfg.rewards["action_rate_l2"].weight = -0.3
 
     # ── Terminations ──────────────────────────────────────────────────────────
     cfg.terminations["time_out"].time_out = True
@@ -266,15 +303,24 @@ def make_microduck_jump_env_cfg(play: bool = False, rough: bool = False) -> Mana
         time_out=False,
         params={"sensor_names": (feet_ground_cfg.name,)},
     )
+    # Orientation termination (45°): allows exploration noise during deep crouch/launch
+    # while terminating if robot completely loses balance.
     cfg.terminations["fell_over"] = TerminationTermCfg(
         func=mdp.bad_orientation,
         time_out=False,
-        params={"limit_angle": math.radians(70.0)},
+        params={"limit_angle": math.radians(45.0)},
+    )
+    # Realistic head pitch limits (-35° to +75°): allows natural head motion during deep squat
+    # without triggering premature 0.08s resets, while still preventing head collision cheating!
+    cfg.terminations["bad_head_pitch"] = TerminationTermCfg(
+        func=microduck_mdp.head_orientation_exceeded,
+        time_out=False,
+        params={"max_pitch_deg": 75.0, "min_pitch_deg": -35.0},
     )
     cfg.terminations["fell_down"] = TerminationTermCfg(
         func=microduck_mdp.root_height_below,
         time_out=False,
-        params={"min_height": 0.045},
+        params={"min_height": 0.038},
     )
 
     # ── Observations (identical 61D layout to walking / trick policies) ──────
@@ -451,7 +497,7 @@ def make_microduck_jump_env_cfg(play: bool = False, rough: bool = False) -> Mana
         params={
             "reward_name": "action_rate_l2",
             "weight_stages": [
-                {"step": 0, "weight": -0.0005},
+                {"step": 0, "weight": -0.008},
             ],
         },
     )
@@ -492,9 +538,9 @@ MicroduckJumpRlCfg = RslRlOnPolicyRunnerCfg(
     ),
     wandb_project="mjlab_microduck",
     experiment_name="jump",
-    run_name="jump",
-    save_interval=50,
+    run_name="run78_zero_pitch_triple_extension_jump",
+    save_interval=15,
     num_steps_per_env=NUM_STEPS_PER_ENV,
-    max_iterations=2000,
+    max_iterations=1200,
 )
 

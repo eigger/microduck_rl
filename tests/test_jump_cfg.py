@@ -21,23 +21,27 @@ def test_jump_rewards_present_and_signs():
     cfg = make_microduck_jump_env_cfg()
     r = cfg.rewards
 
-    # Positive jump rewards
-    assert "jump_crouch" in r and r["jump_crouch"].weight > 0
-    assert "jump_flight" in r and r["jump_flight"].weight > 0
-    assert "jump_takeoff_vz" in r and r["jump_takeoff_vz"].weight > 0
+    # Positive jump rewards (Two-Phase Vertical Squat Jump)
+    assert "jump_slewed_crouch" in r and r["jump_slewed_crouch"].weight > 0
+    assert "jump_vertical_thrust" in r and r["jump_vertical_thrust"].weight > 0
+    assert "jump_straight_flight" in r and r["jump_straight_flight"].weight > 0
     assert "jump_landing_cushion" in r and r["jump_landing_cushion"].weight > 0
     assert "jump_landing_rest" in r and r["jump_landing_rest"].weight > 0
     assert "upright" in r and r["upright"].weight > 0
 
     # Self-negating penalty (returns <= 0, positive weight)
-    assert "leg_symmetry" in r and r["leg_symmetry"].weight > 0
     assert "knee_hyperextension" in r and r["knee_hyperextension"].weight > 0
-    assert "jump_sagittal_foot" in r and r["jump_sagittal_foot"].weight > 0
-
+    assert "foot_height_symmetry" in r and r["foot_height_symmetry"].weight > 0
 
     # Negative regularizers
+    assert "hip_yaw_neutral" in r and r["hip_yaw_neutral"].weight < 0
     assert "hip_lateral_spread" in r and r["hip_lateral_spread"].weight < 0
+    assert "jump_roll_tilt" in r and r["jump_roll_tilt"].weight < 0
+    assert "jump_yaw" in r and r["jump_yaw"].weight < 0
+    assert "jump_lateral_drift" in r and r["jump_lateral_drift"].weight < 0
+    assert "feet_lateral_rail" in r and r["feet_lateral_rail"].weight < 0
     assert "head_neutral" in r and r["head_neutral"].weight < 0
+    assert "head_action_l2" in r and r["head_action_l2"].weight < 0
     assert "jump_drift" in r and r["jump_drift"].weight < 0
     assert "soft_landing" in r and r["soft_landing"].weight < 0
     assert "self_collisions" in r and r["self_collisions"].weight < 0
@@ -60,11 +64,12 @@ def test_jump_sensors_and_terminations():
     assert "time_out" in cfg.terminations
     assert "nan_state" in cfg.terminations
     assert "fell_over" in cfg.terminations
+    assert "bad_head_pitch" in cfg.terminations
 
 
 def test_jump_play_variant():
     cfg = make_microduck_jump_env_cfg(play=True)
-    assert "jump_flight" in cfg.rewards
+    assert "jump_straight_flight" in cfg.rewards
 
 
 def test_actor_observation_keeps_the_61d_slot_layout():

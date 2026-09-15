@@ -16,7 +16,7 @@ def record_jump(onnx_path, out_gif="scratch/jump_rollout.gif", total_steps=75): 
         walking_onnx_path='policies/alpha_walking.onnx',
         standing_onnx_path='policies/alpha_stand.onnx',
         jump_onnx_path=onnx_path,
-        new_cmd_obs=True, use_projected_gravity=True, jump_duration=0.48,
+        new_cmd_obs=True, use_projected_gravity=True, jump_duration=0.60,
     )
 
     mujoco.mj_resetDataKeyframe(model, data, 1)

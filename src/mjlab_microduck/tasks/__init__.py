@@ -87,6 +87,10 @@ from .microduck_jump_env_cfg import (
     make_microduck_jump_env_cfg,
     MicroduckJumpRlCfg,
 )
+from .microduck_squat_env_cfg import (
+    make_microduck_squat_env_cfg,
+    MicroduckSquatRlCfg,
+)
 from .backlash import make_backlash_variant
 
 # Jump task — crouch, explosive upward launch, both feet airborne, landing rest
@@ -163,6 +167,23 @@ register_mjlab_task(
     env_cfg=make_microduck_sitstand_env_cfg(rough=True),
     play_env_cfg=make_microduck_sitstand_env_cfg(play=True, rough=True),
     rl_cfg=MicroduckSitStandRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Squat task — stand to deep squat (lowest stable posture), gently
+register_mjlab_task(
+    task_id="Mjlab-Squat-Flat-MicroDuck",
+    env_cfg=make_microduck_squat_env_cfg(),
+    play_env_cfg=make_microduck_squat_env_cfg(play=True),
+    rl_cfg=MicroduckSquatRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+register_mjlab_task(
+    task_id="Mjlab-Squat-Rough-MicroDuck",
+    env_cfg=make_microduck_squat_env_cfg(rough=True),
+    play_env_cfg=make_microduck_squat_env_cfg(play=True, rough=True),
+    rl_cfg=MicroduckSquatRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
 
@@ -281,6 +302,8 @@ _BACKLASH_TASKS = (
     ("Mjlab-StandUp-Rough-Backlash-MicroDuck", make_microduck_standup_env_cfg, {"rough": True}, MicroduckStandUpRlCfg, _BL_GROUNDCONTACT),
     ("Mjlab-SitStand-Flat-Backlash-MicroDuck", make_microduck_sitstand_env_cfg, {}, MicroduckSitStandRlCfg, _BL_GROUNDCONTACT),
     ("Mjlab-SitStand-Rough-Backlash-MicroDuck", make_microduck_sitstand_env_cfg, {"rough": True}, MicroduckSitStandRlCfg, _BL_GROUNDCONTACT),
+    ("Mjlab-Squat-Flat-Backlash-MicroDuck", make_microduck_squat_env_cfg, {}, MicroduckSquatRlCfg, _BL_GROUNDCONTACT),
+    ("Mjlab-Squat-Rough-Backlash-MicroDuck", make_microduck_squat_env_cfg, {"rough": True}, MicroduckSquatRlCfg, _BL_GROUNDCONTACT),
     ("Mjlab-GroundPick-Flat-Backlash-MicroDuck", make_microduck_ground_pick_env_cfg, {}, MicroduckGroundPickRlCfg, _BL_GROUNDCONTACT),
     ("Mjlab-GroundPick-Rough-Backlash-MicroDuck", make_microduck_ground_pick_env_cfg, {"rough": True}, MicroduckGroundPickRlCfg, _BL_GROUNDCONTACT),
     ("Mjlab-BallKick-Flat-Backlash-MicroDuck", make_microduck_ball_kick_env_cfg, {}, MicroduckBallKickRlCfg, _BL_GROUNDCONTACT),
