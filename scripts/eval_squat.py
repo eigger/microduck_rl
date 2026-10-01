@@ -101,8 +101,10 @@ def evaluate_squat(onnx_path, out_gif="docs/media/run79_deep_squat.gif"):
                 if any(k in (b1, b2) for k in ("jaw_soft", "neck", "neck_pitch", "head_pitch")):
                     head_contacts += 1
 
-        # Track body kinematics
+        # Track body kinematics and foot positions
         trunk_pos = data.xpos[trunk_id].copy()
+        l_foot_pos = data.site_xpos[l_foot_id].copy()
+        r_foot_pos = data.site_xpos[r_foot_id].copy()
         q = data.qpos[3:7]  # root orientation quaternion [w, x, y, z]
 
         # Euler angles (roll, pitch, yaw)
@@ -121,6 +123,10 @@ def evaluate_squat(onnx_path, out_gif="docs/media/run79_deep_squat.gif"):
             "z": trunk_pos[2],
             "x": trunk_pos[0],
             "y": trunk_pos[1],
+            "l_foot_x": l_foot_pos[0],
+            "l_foot_y": l_foot_pos[1],
+            "r_foot_x": r_foot_pos[0],
+            "r_foot_y": r_foot_pos[1],
             "roll": roll,
             "pitch": pitch,
             "yaw": yaw,
@@ -142,6 +148,17 @@ def evaluate_squat(onnx_path, out_gif="docs/media/run79_deep_squat.gif"):
     min_z = min(r["z"] for r in records)
     min_z_step = min(records, key=lambda r: r["z"])["step"]
 
+    # Foot drift analysis
+    init_l_foot = np.array([records[0]["l_foot_x"], records[0]["l_foot_y"]])
+    init_r_foot = np.array([records[0]["r_foot_x"], records[0]["r_foot_y"]])
+
+    l_drifts = [np.linalg.norm(np.array([r["l_foot_x"], r["l_foot_y"]]) - init_l_foot) for r in records]
+    r_drifts = [np.linalg.norm(np.array([r["r_foot_x"], r["r_foot_y"]]) - init_r_foot) for r in records]
+    max_l_drift = max(l_drifts)
+    max_r_drift = max(r_drifts)
+    end_l_drift = l_drifts[-1]
+    end_r_drift = r_drifts[-1]
+
     pitches = [abs(r["pitch"]) for r in records]
     rolls = [abs(r["roll"]) for r in records]
     yaws = [abs(r["yaw"]) for r in records]
@@ -160,13 +177,15 @@ def evaluate_squat(onnx_path, out_gif="docs/media/run79_deep_squat.gif"):
     avg_desc_speed = z_diff_desc / 2.0  # m/s
 
     print("\n" + "="*70)
-    print("           RUN 79 DEEP SQUAT PHYSICAL MEASUREMENT REPORT")
+    print("           PHYSICAL MEASUREMENT REPORT")
     print("="*70)
     print(f"  • Starting Height (Z):        {start_z*1000:.1f} mm  (Stand Home)")
     print(f"  • Lowest Squat Depth (Z_min):  {min_z*1000:.1f} mm  (at Step {min_z_step}, t={min_z_step*0.02:.2f}s)")
     print(f"  • Final Settled Height:       {end_z*1000:.1f} mm  (target SIT_Z: 60.0 mm)")
     print(f"  • Height Delta (Drop):        {(start_z - min_z)*1000:.1f} mm deep crouch")
     print(f"  • Avg Descent Speed:          {avg_desc_speed*1000:.1f} mm/s  (smooth gentle descent)")
+    print(f"  • Max Foot Drift (Left):      {max_l_drift*1000:.1f} mm  (end: {end_l_drift*1000:.1f} mm)")
+    print(f"  • Max Foot Drift (Right):     {max_r_drift*1000:.1f} mm  (end: {end_r_drift*1000:.1f} mm)")
     print(f"  • Max Body Pitch Tilt:        {max_pitch:.2f}°  (target < 15°)")
     print(f"  • Final Settled Pitch:        {end_pitch:.2f}°  (rock solid upright)")
     print(f"  • Max Body Roll Tilt:         {max_roll:.2f}°  (target < 10°)")
@@ -183,17 +202,16 @@ def evaluate_squat(onnx_path, out_gif="docs/media/run79_deep_squat.gif"):
     print(f"  Saved GIF: {out_gif} ({os.path.getsize(out_gif)/(1024*1024):.2f} MB)")
 
     # Save keyframe snapshots for markdown report
-    # Step 0 (Stand), Step 40 (Mid-descent), Step 100 (Deep squat floor), Step 180 (Settled hold)
     snapshot_steps = [0, 40, 100, 180]
+    run_prefix = "run80" if "run80" in out_gif else "run79"
     snapshot_names = [
-        "run79_squat_01_stand.png",
-        "run79_squat_02_descent.png",
-        "run79_squat_03_deep_floor.png",
-        "run79_squat_04_settled_hold.png",
+        f"{run_prefix}_squat_01_stand.png",
+        f"{run_prefix}_squat_02_descent.png",
+        f"{run_prefix}_squat_03_deep_floor.png",
+        f"{run_prefix}_squat_04_settled_hold.png",
     ]
 
     for s_step, s_name in zip(snapshot_steps, snapshot_names):
-        # Frame index corresponds to step // 2
         f_idx = min(s_step // 2, len(frames) - 1)
         out_png = os.path.join("docs", "media", s_name)
         imageio.imwrite(out_png, frames[f_idx])
@@ -207,6 +225,8 @@ def evaluate_squat(onnx_path, out_gif="docs/media/run79_deep_squat.gif"):
         "end_pitch": end_pitch,
         "max_roll": max_roll,
         "end_roll": end_roll,
+        "max_l_drift": max_l_drift,
+        "max_r_drift": max_r_drift,
         "head_contacts": head_contacts,
         "max_l_knee": max_l_knee,
         "min_r_knee": min_r_knee,
@@ -214,5 +234,7 @@ def evaluate_squat(onnx_path, out_gif="docs/media/run79_deep_squat.gif"):
     }
 
 if __name__ == "__main__":
-    onnx_file = sys.argv[1] if len(sys.argv) > 1 else "logs/rsl_rl/microduck_squat/2026-09-16_07-35-48_run79_deep_squat_flat/2026-09-16_07-35-48_run79_deep_squat_flat.onnx"
-    evaluate_squat(onnx_file)
+    onnx_file = sys.argv[1] if len(sys.argv) > 1 else "policies/squat.onnx"
+    out_gif = sys.argv[2] if len(sys.argv) > 2 else "docs/media/run80_deep_squat.gif"
+    evaluate_squat(onnx_file, out_gif=out_gif)
+

@@ -108,6 +108,53 @@ HOME_FRAME = EntityCfg.InitialStateCfg(
     joint_vel={".*": 0.0},
 )
 
+SQUAT_HOME_FRAME = EntityCfg.InitialStateCfg(
+    joint_pos={
+        # Run 82 statically verified deep squat equilibrium pose (Z = 0.075m, pitch = 0.0 deg)
+        r".*hip_yaw.*": 0.0,
+        r".*left_hip_roll.*": 0.0,
+        r".*right_hip_roll.*": 0.0,
+        r".*left_hip_pitch.*": 0.3670,
+        r".*right_hip_pitch.*": -0.3670,
+        r".*left_knee.*": 1.4294,
+        r".*right_knee.*": -1.4294,
+        r".*left_ankle.*": 1.0624,
+        r".*right_ankle.*": -1.0624,
+        # Head
+        r".*neck_pitch.*": 0.3491,
+        r".*head_pitch.*": 0.3491,
+        r".*head_yaw.*": 0.0,
+        r".*head_roll.*": 0.0,
+    },
+    joint_vel={".*": 0.0},
+)
+
+
+# Jump target pose: full extension from deep squat.
+# Robot extends from squat (Z≈0.075m) to this upright-on-tiptoes pose.
+# Key differences vs HOME_FRAME:
+#   - knee: fully straight (0 rad vs HOME ±0.005 rad)  ← triple extension
+#   - ankle: plantar-flexed (±0.20 rad vs HOME ±0.453 rad) ← foot pushes down/back
+#   - hip_pitch: nearly upright (±0.20 rad vs HOME ±0.458 rad) ← trunk rises
+# This is the "launch apex pose" — the posture the robot reaches at full extension.
+# (Expressed as joint_pos values matching SQUAT_HOME_FRAME pattern keys.)
+JUMP_TARGET_POSE = {
+    r".*hip_yaw.*":         0.0,
+    r".*left_hip_roll.*":  -0.0873,
+    r".*right_hip_roll.*":  0.0873,
+    r".*left_hip_pitch.*": -0.20,
+    r".*right_hip_pitch.*":  0.20,
+    r".*left_knee.*":        0.0,
+    r".*right_knee.*":       0.0,
+    r".*left_ankle.*":       0.20,
+    r".*right_ankle.*":     -0.20,
+    # Head: neutral (same as HOME)
+    r".*neck_pitch.*":  0.3491,
+    r".*head_pitch.*":  0.3491,
+    r".*head_yaw.*":    0.0,
+    r".*head_roll.*":   0.0,
+}
+
 FULL_COLLISION = CollisionCfg(
     geom_names_expr=[".*_collision"],
     condim={r"^(left|right)_foot_collision$": 3, ".*_collision": 1},
@@ -191,6 +238,16 @@ MICRODUCK_STANDUP_ROBOT_CFG = EntityCfg(
 MICRODUCK_GROUND_PICK_ROBOT_CFG = EntityCfg(
     spec_fn=get_ground_pick_spec,
     init_state=HOME_FRAME,
+    collisions=(FULL_COLLISION,),
+    articulation=EntityArticulationInfoCfg(
+        actuators=(actuators,),
+        soft_joint_pos_limit_factor=0.9,
+    ),
+)
+
+MICRODUCK_GROUND_PICK_SQUAT_ROBOT_CFG = EntityCfg(
+    spec_fn=get_ground_pick_spec,
+    init_state=SQUAT_HOME_FRAME,
     collisions=(FULL_COLLISION,),
     articulation=EntityArticulationInfoCfg(
         actuators=(actuators,),

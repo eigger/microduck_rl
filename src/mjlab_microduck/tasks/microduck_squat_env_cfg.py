@@ -10,6 +10,11 @@ Initial state:
     Always starts standing (standing_prob=1.0, sitting_prob=0.0).
 Episode duration:
     4.0 seconds: 2.0 s ramp down + 2.0 s hold at deep squat rest.
+
+Key constraint vs. Run 79:
+    foot_xy_drift_penalty locks foot XY positions to their spawn coordinates.
+    Without this, the policy slides feet forward to cheaply lower trunk height
+    instead of doing a proper squat with planted feet.
 """
 
 import math
@@ -48,20 +53,22 @@ EPISODE_LENGTH_S = 4.0
 POSTURE_DWELL_S  = (4.0, 4.0)
 SIT_PROB         = 1.0  # Always SIT/SQUAT
 
-# ── SQUAT / SIT keyframe (joint_pos index → angle in rad) ───────────────────
-# STABILITY-VERIFIED 2026-07-27:
-# knee ±1.35, hip_pitch = HOME ∓ 0.05 lean, ankle 0, hip_roll 0 settles at
-# 3-5° tilt for 95-100% of noisy resets.
+# ── SQUAT keyframe: physically verified static equilibrium squat ─────────────
+# Solved via inverse kinematics and CoM balancing in MuJoCo physics:
+# - Both feet 100% flat on the ground (Delta ankle == Delta knee, cancels foot pitch)
+# - Knee bent forward (+1.4294 rad)
+# - Hip pitched forward (+0.3670 rad) to keep CoM_x = 0.0mm directly above the feet
+# - Trunk Z settles at 0.075m (deep stable squat, 43.5mm drop from standing 0.1185m)
 SITTING_TARGET_OVERRIDES = {
     1:   0.0,      # left  hip_roll   (HOME -0.0873)
-    2:  -0.4079,   # left  hip_pitch  (HOME -0.4579; +0.05 = slight fwd lean)
-    3:   1.35,     # left  knee       (HOME -0.0049)
-    4:   0.0,      # left  ankle      (HOME +0.4530)
+    2:   0.3670,   # left  hip_pitch  (HOME -0.4579)
+    3:   1.4294,   # left  knee       (HOME -0.0049)
+    4:   1.0624,   # left  ankle      (HOME +0.4530)
     # neck/head steered by the head_pose command.
     10:  0.0,      # right hip_roll   (HOME +0.0873)
-    11:  0.4079,   # right hip_pitch  (HOME +0.4579)
-    12: -1.35,     # right knee       (HOME +0.0049)
-    13:  0.0,      # right ankle      (HOME -0.4530)
+    11: -0.3670,   # right hip_pitch  (HOME +0.4579)
+    12: -1.4294,   # right knee       (HOME +0.0049)
+    13: -1.0624,   # right ankle      (HOME -0.4530)
 }
 
 _LEG_JOINTS  = [0, 1, 2, 3, 4, 9, 10, 11, 12, 13]
@@ -69,13 +76,15 @@ _NECK_JOINTS = [5, 6, 7, 8]
 
 # Trunk height targets (m)
 STAND_Z = 0.115
-SIT_Z   = 0.060
+SIT_Z   = 0.075
 
 STAND_UPRIGHT_Z = 0.10
 SIT_UPRIGHT_Z   = 0.075
 
 POSTURE_RAMP_S = 2.0
 MAX_DESCENT_SPEED = 0.05
+# Max foot XY slide allowed from spawn position (m). ~2 cm tolerance for DR jitter.
+FOOT_XY_DRIFT_LIMIT = 0.02
 
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs.mdp import dr
@@ -153,7 +162,13 @@ def make_microduck_squat_env_cfg(
     assert isinstance(joint_pos_action, JointPositionActionCfg)
     joint_pos_action.scale = 1.0
 
+    # ── Foot site cfg for drift penalty (left_foot, right_foot sites) ──────────
+    foot_site_cfg = SceneEntityCfg("robot", site_names=["left_foot", "right_foot"])
+
     # ── Rewards: drop walking-specific terms ──────────────────────────────────
+    # foot_xy_drift_penalty (below) enforces planted feet via position locking.
+    # foot_slip from the base velocity env is removed: it reads foot geom velocities
+    # against the sensor slot layout which differs in the squat scene and crashes.
     for name in [
         "track_linear_velocity",
         "track_angular_velocity",
@@ -170,7 +185,7 @@ def make_microduck_squat_env_cfg(
     # Pose target — legs only (head is command-steered).
     cfg.rewards["posture_pose_legs"] = RewardTermCfg(
         func=microduck_mdp.posture_pose_match,
-        weight=4.0,
+        weight=8.0,
         params={
             "command_name":  "twist",
             "std":           0.5,
@@ -189,7 +204,7 @@ def make_microduck_squat_env_cfg(
     # L1 bootstrap toward the squat pose.
     cfg.rewards["posture_pose_l1"] = RewardTermCfg(
         func=microduck_mdp.posture_pose_l1,
-        weight=1.0,
+        weight=3.0,
         params={
             "command_name":  "twist",
             "joint_indices": _LEG_JOINTS,
@@ -220,7 +235,7 @@ def make_microduck_squat_env_cfg(
     )
     cfg.rewards["posture_height_l1"] = RewardTermCfg(
         func=microduck_mdp.posture_height_l1,
-        weight=6.0,
+        weight=15.0,
         params={
             "command_name": "twist",
             "sit_z":        SIT_Z,
@@ -247,12 +262,12 @@ def make_microduck_squat_env_cfg(
     # Two-layer upright pressure
     cfg.rewards["upright_linear"] = RewardTermCfg(
         func=microduck_mdp.body_upright_linear,
-        weight=2.5,
+        weight=2.0,
         params={"asset_cfg": SceneEntityCfg("robot", body_names=("trunk_base",))},
     )
     cfg.rewards["upright_while_tall"] = RewardTermCfg(
         func=microduck_mdp.upright_while_tall,
-        weight=1.5,
+        weight=0.2,
         params={
             "height_low":  SIT_UPRIGHT_Z,
             "height_high": STAND_UPRIGHT_Z,
@@ -308,6 +323,20 @@ def make_microduck_squat_env_cfg(
         func=mdp.self_collision_cost,
         weight=-1.0,
         params={"sensor_name": self_collision_cfg.name},
+    )
+
+    # ── Foot-plant enforcement ─────────────────────────────────────────────────
+    # Self-negating (returns <=0) → POSITIVE weight.
+    # Penalises cumulative XY drift of the foot sites from their spawn position.
+    # Softened to 6.0 so the policy is free to explore leg flexion without being
+    # paralyzed by foot placement taxes at early iterations.
+    cfg.rewards["foot_xy_drift"] = RewardTermCfg(
+        func=microduck_mdp.foot_xy_drift_penalty,
+        weight=6.0,
+        params={
+            "asset_cfg": foot_site_cfg,
+            "max_drift": FOOT_XY_DRIFT_LIMIT,
+        },
     )
 
     if "upright" in cfg.rewards:

@@ -2511,6 +2511,39 @@ def trunk_downward_velocity_penalty(
     return -torch.clamp(-vz - max_down_vel, min=0.0)
 
 
+def foot_xy_drift_penalty(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg,
+    max_drift: float = 0.02,
+) -> torch.Tensor:
+    """Penalty for feet drifting from their initial XY position at episode reset.
+
+    Stores left/right foot site XY positions at episode reset (episode_length_buf <= 1)
+    and penalises any horizontal drift beyond ``max_drift`` (m). This enforces
+    proper squat mechanics: feet remain planted on the ground while the body
+    descends, rather than sliding forward to cheaply lower trunk height.
+
+    Self-negating (returns <= 0) → use a POSITIVE weight.
+
+    Penalty shape: -sum_over_feet( max(|drift_xy| - max_drift, 0) )
+    Zero when both feet are within the allowed drift radius; linear beyond it.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+
+    # site_pos_w: (B, N_sites, 3)
+    foot_xy = asset.data.site_pos_w[:, asset_cfg.site_ids, :2]  # (B, N_feet, 2)
+
+    if not hasattr(env, "_squat_foot_xy_init") or env._squat_foot_xy_init.shape[0] != foot_xy.shape[0]:
+        env._squat_foot_xy_init = foot_xy.detach().clone()
+
+    fresh = env.episode_length_buf <= 1  # (B,)
+    env._squat_foot_xy_init[fresh] = foot_xy[fresh].detach().clone()
+
+    drift = torch.norm(foot_xy - env._squat_foot_xy_init, dim=-1)  # (B, N_feet)
+    excess = torch.clamp(drift - max_drift, min=0.0)
+    return -excess.sum(dim=-1)  # (B,)
+
+
 def seated_stillness(
     env: ManagerBasedRlEnv,
     height_full: float = 0.06,
@@ -7221,11 +7254,11 @@ def _update_jump_crouch_metrics(env: ManagerBasedRlEnv, asset: Entity) -> tuple[
 def _compute_crouch_gate(max_knee: torch.Tensor, max_pitch: torch.Tensor) -> torch.Tensor:
     """Activation gate that requires a genuine, upright knee squat to unlock jump rewards.
 
-    - knee_gate: 0.0 below 0.20 rad (11° bend), ramps smoothly to 1.0 at 0.60 rad (34° deep squat).
+    - knee_gate: 0.0 below 0.35 rad (20° bend), ramps smoothly to 1.0 at 0.90 rad (52° deep squat).
     - pitch_gate: 1.0 when pitch <= 15° (0.26), fades to 0.0 at 30° (0.50).
     Allows healthy initial PPO exploration noise without prematurely locking the gate!
     """
-    knee_gate = torch.clamp((max_knee - 0.20) / 0.40, min=0.0, max=1.0)
+    knee_gate = torch.clamp((max_knee - 0.35) / 0.55, min=0.0, max=1.0)
     pitch_gate = torch.clamp((0.50 - max_pitch) / 0.24, min=0.0, max=1.0)
     return knee_gate * pitch_gate
 
@@ -7239,10 +7272,10 @@ def jump_slewed_crouch_reward(
 ) -> torch.Tensor:
     """Phase 1: Slow, smooth, controlled deep squat down (t in 0.00s - 0.36s, steps 0-18).
 
-    Tracks an exact zero-pitch kinematic squat trajectory:
-    - Knee: ramps from 0 to +0.87 rad (+50.0° flex)
-    - Hip pitch: ramps from HOME (-0.458 rad) to +0.63 rad (+36.1° to maintain 0° pitch)
-    - Ankle: ramps from +0.453 rad to +0.38 rad (+21.8°)
+    Tracks the Run 82 mathematically exact zero-pitch static equilibrium squat trajectory:
+    - Knee: ramps from 0 to +1.4294 rad (+81.9° flex)
+    - Hip pitch: ramps from HOME (-0.4579 rad) to +0.3670 rad (+21.0° to maintain 0° pitch)
+    - Ankle: ramps from +0.4530 rad to +1.0624 rad (+60.9° to compensate knee 1:1 and keep foot flat!)
     Uses MULTIPLICATIVE composite so all 3 joints must track together without compromise basins!
     """
     asset: Entity = env.scene[asset_cfg.name]
@@ -7254,9 +7287,9 @@ def jump_slewed_crouch_reward(
     max_knee, max_pitch = _update_jump_crouch_metrics(env, asset)
 
     alpha = torch.clamp(step_count.float() / float(ramp_steps), min=0.0, max=1.0)
-    tgt_knee = alpha * 0.87
-    tgt_hip = -0.458 + alpha * 1.088
-    tgt_ankle = 0.453 - alpha * 0.073
+    tgt_knee = alpha * 1.4294
+    tgt_hip = -0.4579 + alpha * 0.8249
+    tgt_ankle = 0.4530 + alpha * 0.6094
 
     joint_pos = _servo_joint_pos(env, asset)
     cur_knee = 0.5 * (joint_pos[:, 3] - joint_pos[:, 12])
@@ -7269,9 +7302,9 @@ def jump_slewed_crouch_reward(
 
     # Multiplicative product prevents cheating on any single joint!
     pose_match = (
-        torch.exp(-err_k / (0.28 ** 2))
-        * torch.exp(-err_h / (0.28 ** 2))
-        * torch.exp(-err_a / (0.25 ** 2))
+        torch.exp(-err_k / (0.32 ** 2))
+        * torch.exp(-err_h / (0.32 ** 2))
+        * torch.exp(-err_a / (0.28 ** 2))
     )
 
     contacts = sensor.data.found
@@ -7308,16 +7341,16 @@ def jump_slewed_crouch_l1_reward(
     active = (step_count <= max_step).float()
 
     alpha = torch.clamp(step_count.float() / float(ramp_steps), min=0.0, max=1.0)
-    tgt_knee = alpha * 0.87
-    tgt_hip = -0.458 + alpha * 1.088
-    tgt_ankle = 0.453 - alpha * 0.073
+    tgt_knee = alpha * 1.4294
+    tgt_hip = -0.4579 + alpha * 0.8249
+    tgt_ankle = 0.4530 + alpha * 0.6094
 
     joint_pos = _servo_joint_pos(env, asset)
     cur_knee = 0.5 * (joint_pos[:, 3] - joint_pos[:, 12])
     cur_hip = 0.5 * (joint_pos[:, 2] - joint_pos[:, 11])
     cur_ankle = 0.5 * (joint_pos[:, 4] - joint_pos[:, 13])
 
-    l1_err = torch.abs(cur_knee - tgt_knee) + torch.abs(cur_hip - tgt_hip) + 0.5 * torch.abs(cur_ankle - tgt_ankle)
+    l1_err = torch.abs(cur_knee - tgt_knee) + torch.abs(cur_hip - tgt_hip) + 0.8 * torch.abs(cur_ankle - tgt_ankle)
     return -active * l1_err
 
 
@@ -7339,22 +7372,26 @@ def jump_early_launch_penalty(
 
 def jump_vertical_thrust_reward(
     env: ManagerBasedRlEnv,
-    target_vz: float = 0.60,
-    min_step: int = 16,
-    max_step: int = 27,
+    target_vz: float = 0.65,
+    min_step: int = 0,
+    max_step: int = 14,
+    bypass_crouch_gate: bool = False,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Phase 2: Explosive upward thrust and Triple Extension (t in 0.32s - 0.54s, steps 16-27).
+    """Phase 2: Symmetrical explosive upward thrust and Triple Extension (t in 0.00s - 0.28s).
 
-    Requires having completed a genuine deep squat (crouch_gate).
-    Rewards upward launch velocity Vz coupled with knee extension and ankle plantarflexion ground push!
+    Requires having completed a genuine deep squat (crouch_gate), or bypasses if spawned in squat.
+    Rewards upward launch velocity Vz coupled with linear normalized triple extension!
     """
     asset: Entity = env.scene[asset_cfg.name]
     step_count = env.episode_length_buf
     active = ((step_count >= min_step) & (step_count <= max_step)).float()
 
-    max_knee, max_pitch = _update_jump_crouch_metrics(env, asset)
-    crouch_gate = _compute_crouch_gate(max_knee, max_pitch)
+    if bypass_crouch_gate:
+        crouch_gate = 1.0
+    else:
+        max_knee, max_pitch = _update_jump_crouch_metrics(env, asset)
+        crouch_gate = _compute_crouch_gate(max_knee, max_pitch)
 
     vz = torch.nan_to_num(asset.data.root_link_lin_vel_w[:, 2], nan=0.0)
     vz_score = torch.clamp(vz / target_vz, min=0.0, max=1.5)
@@ -7364,32 +7401,90 @@ def jump_vertical_thrust_reward(
     cur_hip = 0.5 * (joint_pos[:, 2] - joint_pos[:, 11])
     cur_ankle = 0.5 * (joint_pos[:, 4] - joint_pos[:, 13])
 
-    # 1. Knees extending rapidly toward 0
-    knee_ext = torch.exp(-torch.square(cur_knee) / (0.22 ** 2))
-    # 2. Ankles pushing ground via plantarflexion (+0.45 rad to +0.95 rad)
-    ankle_push = torch.clamp((cur_ankle - 0.45) / 0.50, min=0.0, max=1.2)
-    # 3. Hips extending backward (-0.80 rad to -1.30 rad) to balance ground reaction force through CoM!
-    # NOTE: HOME hip is -0.458 rad. Posterior extension pushes it more negative (-0.80 rad ~ -1.30 rad)!
-    hip_ext = torch.clamp((-0.458 - cur_hip) / 0.60, min=0.0, max=1.2)
+    # Triple Extension Progress: linear normalized progress with smooth gradients from t=0!
+    # Knee: 1.4294 rad (squat) -> 0.0 rad (standing extension)
+    knee_prog = torch.clamp((1.4294 - cur_knee) / 1.4294, min=0.0, max=1.2)
+    # Hip: +0.3670 rad (squat forward pitch) -> -0.4579 rad (standing back-extension)
+    hip_prog = torch.clamp((0.3670 - cur_hip) / (0.3670 - (-0.4579)), min=0.0, max=1.2)
+    # Ankle: +1.0624 rad (squat) -> +0.4530 rad (standing push)
+    ankle_prog = torch.clamp((1.0624 - cur_ankle) / (1.0624 - 0.4530), min=0.0, max=1.2)
 
-    triple_extension = 0.35 * knee_ext + 0.35 * ankle_push + 0.30 * hip_ext
+    # Bottleneck triple extension: all three joints MUST extend together!
+    # If ankle or hip stays behind, the min_prog collapses the reward.
+    min_prog = torch.minimum(torch.minimum(knee_prog, hip_prog), ankle_prog)
+    mean_prog = (knee_prog + hip_prog + ankle_prog) / 3.0
+    triple_extension = 0.70 * min_prog + 0.30 * mean_prog
 
     gx = asset.data.projected_gravity_b[:, 0]
     gy = asset.data.projected_gravity_b[:, 1]
-    pitch_gate = torch.exp(-torch.square(gx) / (0.22 ** 2))
-    roll_gate = torch.exp(-torch.square(gy) / (0.18 ** 2))
+    # Strict pitch gate (std 6.9° / 0.12 rad) collapses reward if robot tips forward or backward
+    pitch_gate = torch.exp(-torch.square(gx) / (0.12 ** 2))
+    roll_gate = torch.exp(-torch.square(gy) / (0.12 ** 2))
 
     dx = asset.data.root_link_pos_w[:, 0] - env.scene.env_origins[:, 0]
     dy = asset.data.root_link_pos_w[:, 1] - env.scene.env_origins[:, 1]
-    drift_gate = torch.exp(-torch.square(dx) / (0.060 ** 2)) * torch.exp(-torch.square(dy) / (0.045 ** 2))
+    drift_gate = torch.exp(-torch.square(dx) / (0.050 ** 2)) * torch.exp(-torch.square(dy) / (0.040 ** 2))
 
-    thrust_core = 0.6 * vz_score + 0.4 * triple_extension
+    # Multiplicatively linked: Vz only pays if legs are extending in unison and body is upright!
+    thrust_core = vz_score * triple_extension
     score = active * crouch_gate * thrust_core * pitch_gate * roll_gate * drift_gate
     return torch.nan_to_num(score, nan=0.0)
 
 
+def hip_bow_penalty(
+    env: ManagerBasedRlEnv,
+    max_hip_pitch: float = 0.38,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Self-negating penalty (<= 0): strictly forbids hip flexion beyond squat posture (+0.38 rad / 21.8°).
+
+    Prevents folding/bowing torso forward (head-dive / push-up flop cheat).
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    joint_pos = _servo_joint_pos(env, asset)
+    cur_hip = 0.5 * (joint_pos[:, 2] - joint_pos[:, 11])
+    excess = torch.clamp(cur_hip - max_hip_pitch, min=0.0)
+    return -torch.square(excess * 10.0)
+
+
+def ankle_dorsiflex_penalty(
+    env: ManagerBasedRlEnv,
+    max_ankle_pitch: float = 1.07,  # squat ankle angle ~ 1.0624 rad (60.9°)
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Self-negating penalty (<= 0): strictly forbids ankle dorsiflexion beyond squat posture (+1.07 rad / 61.3°).
+
+    Prevents lifting toes during launch (pushing through heels and causing back-flip).
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    joint_pos = _servo_joint_pos(env, asset)
+    cur_ankle = 0.5 * (joint_pos[:, 4] - joint_pos[:, 13])
+    excess = torch.clamp(cur_ankle - max_ankle_pitch, min=0.0)
+    return -torch.square(excess * 10.0)
+
+
+def body_pitch_penalty(
+    env: ManagerBasedRlEnv,
+    max_pitch_rad: float = 0.14,  # ~8.0 degrees
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Self-negating penalty (<= 0): strictly forbids torso pitch deviation (> 8.0° forward or backward).
+
+    Penalizes both forward bowing (gx > +0.14) and backward flip (gx < -0.14).
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    gx = asset.data.projected_gravity_b[:, 0]
+    tilt = torch.clamp(torch.abs(gx) - max_pitch_rad, min=0.0)
+    return -torch.square(tilt * 10.0)
+
+
+# Keep forward_pitch_penalty as alias pointing to body_pitch_penalty for backwards compatibility
+forward_pitch_penalty = body_pitch_penalty
+
+
 # Backward compatibility alias
 jump_vertical_extension_reward = jump_vertical_thrust_reward
+
 
 
 def jump_straight_flight_reward(
@@ -7399,11 +7494,12 @@ def jump_straight_flight_reward(
     target_height: float = 0.140,
     min_step: int = 22,
     max_step: int = 38,
+    bypass_crouch_gate: bool = False,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """Phase 3: Straight-leg airborne flight (t in 0.44s - 0.76s, steps 22-38).
 
-    Requires having completed a genuine deep squat (crouch_gate).
+    Requires having completed a genuine deep squat (crouch_gate), or bypasses if spawned in squat.
     Requires TRUE FOOT LIFT-OFF (both feet physically elevated off ground).
     Rewards parallel straight legs, level feet, and upright posture!
     """
@@ -7413,8 +7509,11 @@ def jump_straight_flight_reward(
     step_count = env.episode_length_buf
     active = ((step_count >= min_step) & (step_count <= max_step)).float()
 
-    max_knee, max_pitch = _update_jump_crouch_metrics(env, asset)
-    crouch_gate = _compute_crouch_gate(max_knee, max_pitch)
+    if bypass_crouch_gate:
+        crouch_gate = 1.0
+    else:
+        max_knee, max_pitch = _update_jump_crouch_metrics(env, asset)
+        crouch_gate = _compute_crouch_gate(max_knee, max_pitch)
 
     contacts = sensor.data.found
     contact_count = torch.sum(contacts, dim=-1).float()
@@ -8170,5 +8269,589 @@ def feet_lateral_rail_penalty(
     return torch.nan_to_num(cost, nan=0.0)
 
 
+# ---------------------------------------------------------------------------
+# Jump Pose Transition rewards (Run 87)
+# Goal: transition from deep squat (Z=0.075m) to jump target pose (full
+# extension, plantar-flexed) quickly while maintaining balance.
+# ---------------------------------------------------------------------------
+
+def squat_to_jump_pose_reward(
+    env: ManagerBasedRlEnv,
+    target_joint_pos: dict[str, float],
+    std_hip: float = 0.15,
+    std_knee: float = 0.10,
+    std_ankle: float = 0.10,
+    max_step: int = 14,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Gaussian reward for matching the jump target pose joint positions.
+
+    Rewards the robot for reaching the jump target pose (full extension from deep squat)
+    during the takeoff launch window (step <= max_step).
+    Releasing this reward after max_step allows the legs to flex/tuck in flight and
+    align to flat feet for landing and standing.
+
+    Joint mapping (servo indices on the groundcontact model):
+      Left leg:  0=hip_yaw, 1=hip_roll, 2=hip_pitch, 3=knee, 4=ankle
+      Neck/head: 5-8 (excluded here)
+      Right leg: 9=hip_yaw, 10=hip_roll, 11=hip_pitch, 12=knee, 13=ankle
+
+    Args:
+        target_joint_pos: dict mapping regex patterns to target angles (rad).
+            Must cover the 10 leg joints (indices 0-4, 9-13).
+        std_hip:   Gaussian std for hip_yaw / hip_roll / hip_pitch errors (rad).
+        std_knee:  Gaussian std for knee errors (rad) — tighter for full extension.
+        std_ankle: Gaussian std for ankle errors (rad) — tighter for plantar-flex.
+        max_step:  Maximum step index for the takeoff launch phase.
+        asset_cfg: robot entity config.
+
+    Returns:
+        (num_envs,) tensor ∈ [0, 1]; use with positive weight.
+    """
+    active = (env.episode_length_buf <= max_step).float()
+
+    asset: Entity = env.scene[asset_cfg.name]
+    joint_pos = _servo_joint_pos(env, asset)       # (N, 14) servo-only
+    default_pos = _servo_default_joint_pos(env, asset)  # (N, 14)
+
+    # Build target tensor from pattern dict (same logic as mjlab init_state)
+    import re as _re
+    servo_ids = _servo_joint_ids(env, asset)
+    joint_names = [asset.joint_names[i] for i in servo_ids]
+
+    if not hasattr(env, "_jump_target_pos_tensor"):
+        target = default_pos[0].clone()  # (14,) fallback to default
+        for pattern, value in target_joint_pos.items():
+            for idx, name in enumerate(joint_names):
+                if _re.match(pattern, name):
+                    target[idx] = value
+        env._jump_target_pos_tensor = target.unsqueeze(0)  # (1, 14)
+
+    target = env._jump_target_pos_tensor  # (1, 14)
+    err = joint_pos - target              # (N, 14)
+
+    # Per-joint std selection: knee (idx 3,12) and ankle (idx 4,13) get tighter std
+    std = torch.full((14,), std_hip, device=env.device)
+    std[3] = std_knee;  std[4] = std_ankle   # left knee, ankle
+    std[12] = std_knee; std[13] = std_ankle  # right knee, ankle
+
+    # Gaussian per joint, then average over the 10 leg joints (skip neck 5-8)
+    leg_idx = list(range(0, 5)) + list(range(9, 14))
+    err_leg = err[:, leg_idx]      # (N, 10)
+    std_leg = std[leg_idx]         # (10,)
+    gauss = torch.exp(-torch.square(err_leg) / (std_leg ** 2))  # (N, 10)
+    return active * gauss.mean(dim=1)
+
+
+def jump_pose_height_reward(
+    env: ManagerBasedRlEnv,
+    target_z: float = 0.120,
+    std_z: float = 0.015,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Gaussian reward for trunk height reaching the jump target pose height.
+
+    Full extension from deep squat raises trunk from Z≈0.075m → Z≈0.117-0.125m.
+    This reward provides a height gradient complementing the joint-pose tracking.
+
+    Args:
+        target_z: target trunk height above terrain (m). Default 0.120m ≈ standing.
+        std_z:    Gaussian std for height error (m). Default 0.015m.
+        asset_cfg: robot entity config.
+
+    Returns:
+        (num_envs,) tensor ∈ [0, 1]; use with positive weight.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2],
+        nan=0.0,
+    )
+    err_z = z - target_z
+    return torch.exp(-torch.square(err_z) / (std_z ** 2))
+
+
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Jump Take-off, Landing Cushion, and Standing Rest rewards (Run 89)
+# Goal: from deep squat (Z=0.075m), explosive upward thrust to achieve high
+# liftoff (Z_peak >= 0.145m), then compliant landing cushion (absorbing impact
+# by flexing knees/lowering trunk), smoothly rising to standing (Z=0.118m),
+# and completely eliminating rebound hopping.
+# ---------------------------------------------------------------------------
+
+def jump_takeoff_vz_reward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    vz_scale: float = 4.0,
+    max_step: int = 18,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Reward positive vertical velocity when BOTH feet are fully airborne during launch window.
+
+    Restricted to step <= max_step (t <= 0.36s) to prevent the policy from
+    farming takeoff Vz via rebound hopping after touchdown.
+
+    Bilateral Contact Check: Both feet must have detached from the ground.
+    Fixes the one-foot tiptoe cheat where index 0 was airborne while index 1 pushed the ground.
+    """
+    active = (env.episode_length_buf <= max_step).float()
+
+    asset: Entity = env.scene[asset_cfg.name]
+    vz = asset.data.root_link_lin_vel_w[:, 2]  # (N,) world-frame Z velocity
+
+    from mjlab.sensor import ContactSensor
+    sensor: ContactSensor = env.scene[sensor_name]
+    # (N, 2) force magnitude per foot
+    feet_force_mag = torch.norm(torch.nan_to_num(sensor.data.force, nan=0.0), dim=-1)
+    any_contact = torch.any(feet_force_mag > 1.0, dim=-1)   # (N,) True if either foot touching
+    both_airborne = ~any_contact                             # (N,) True if BOTH feet off ground
+
+    vz_positive = torch.clamp(vz, min=0.0)             # (N,) only rising phase counts
+    reward = active * both_airborne.float() * vz_positive * vz_scale
+    return torch.nan_to_num(reward, nan=0.0)
+
+
+def jump_peak_height_reward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    target_z: float = 0.150,
+    std_z: float = 0.025,
+    max_step: int = 24,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Gaussian reward for trunk height above target while BOTH feet are airborne in apex window.
+
+    Restricted to step <= max_step (t <= 0.48s) to eliminate rebound hopping.
+    Requires true bilateral airborne state (both feet off the ground).
+    """
+    active = (env.episode_length_buf <= max_step).float()
+
+    asset: Entity = env.scene[asset_cfg.name]
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2],
+        nan=0.0,
+    )
+
+    from mjlab.sensor import ContactSensor
+    sensor: ContactSensor = env.scene[sensor_name]
+    feet_force_mag = torch.norm(torch.nan_to_num(sensor.data.force, nan=0.0), dim=-1)
+    any_contact = torch.any(feet_force_mag > 1.0, dim=-1)
+    both_airborne = ~any_contact
+
+    err_z = z - target_z
+    gauss = torch.exp(-torch.square(err_z) / (std_z ** 2))
+    return active * both_airborne.float() * gauss
+
+
+def jump_foot_clearance_reward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    min_step: int = 6,
+    max_step: int = 18,
+    target_clearance: float = 0.035,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Phase 2 Aerial Flight: Reward foot clearance (distance above ground) while both feet are airborne.
+
+    Active between step min_step (6, 0.12s) and max_step (18, 0.36s).
+    Requires true bilateral airborne state (both feet off ground).
+    Directly incentivizes tucking/lifting feet off the floor during the apex of flight.
+    """
+    step_count = env.episode_length_buf
+    active = ((step_count >= min_step) & (step_count <= max_step)).float()
+
+    from mjlab.sensor import ContactSensor
+    sensor: ContactSensor = env.scene[sensor_name]
+    feet_force_mag = torch.norm(torch.nan_to_num(sensor.data.force, nan=0.0), dim=-1)
+    any_contact = torch.any(feet_force_mag > 1.0, dim=-1)
+    both_airborne = (~any_contact).float()
+
+    asset: Entity = env.scene[asset_cfg.name]
+    if not hasattr(env, "_foot_site_ids"):
+        env._foot_site_ids = [
+            asset.site_names.index("left_foot"),
+            asset.site_names.index("right_foot"),
+        ]
+    feet_z = asset.data.site_pos_w[:, env._foot_site_ids, 2]
+    min_foot_z = torch.min(feet_z, dim=-1).values
+    terrain_z = env.scene.terrain.env_origins[:, 2]
+    # Ground baseline at rest is ~0.008m
+    clearance = torch.clamp(min_foot_z - terrain_z - 0.008, min=0.0)
+
+    # Score ramps up linearly to target_clearance (35mm) and clamps at 1.5
+    clearance_score = torch.clamp(clearance / max(1e-4, target_clearance), min=0.0, max=1.5)
+
+    quat = asset.data.root_link_quat_w
+    cos_tilt = 1.0 - 2.0 * (quat[:, 1] ** 2 + quat[:, 2] ** 2)
+    upright = torch.clamp(cos_tilt, min=0.0)
+
+    reward = active * both_airborne * upright * clearance_score
+    return torch.nan_to_num(reward, nan=0.0)
+
+
+def symmetric_knee_flexion_score(
+    left_knee: torch.Tensor,
+    right_knee: torch.Tensor,
+    target: float,
+    sym_std: float,
+) -> torch.Tensor:
+    """Gaussian track of a bilateral knee pose. Left flexion is +, right is -.
+
+    A clamp that saturated at ``target`` gave Run 94 a full score for a shallow
+    symmetric crouch (~0.45 rad) and no further gradient, so it dumped one knee
+    and fell. Tracking the target keeps that crouch on the slope and pays less
+    when a knee lets go or folds the wrong way.
+    """
+    err = 0.5 * (
+        torch.square(left_knee - target)
+        + torch.square(right_knee - (-target))
+    )
+    return torch.exp(-err / (sym_std ** 2))
+
+
+def symmetric_hip_pitch_score(
+    left_hip: torch.Tensor,
+    right_hip: torch.Tensor,
+    target: float,
+    std: float,
+) -> torch.Tensor:
+    """Gaussian track of bilateral hip pitch. Left stand is −target, right is +.
+
+    Run 96 held the trunk at 99 mm with the right hip still negative (−10°)
+    while the stand target is positive (+26°). The rise score did not look at
+    the hips, so that fold carried the rest of the pose.
+    """
+    err = 0.5 * (
+        torch.square(left_hip - (-target))
+        + torch.square(right_hip - target)
+    )
+    return torch.exp(-err / (std ** 2))
+
+
+def stand_pose_with_hip(
+    pose_add: torch.Tensor,
+    hip_score: torch.Tensor,
+    slew_done: torch.Tensor,
+) -> torch.Tensor:
+    """Fold hip pitch into the stand score without cutting the current landing.
+
+    Multiplying the whole pose by the hip score halved Run 96's late reward
+    and falls rose from 5 to 43 before the hip moved. After the slew, the hip
+    is one more term in the average, so the parked pose keeps most of its score
+    and the wrong-sign hip still has a slope.
+    """
+    with_hip = (pose_add * 3.0 + hip_score) / 4.0
+    return torch.where(slew_done, with_hip, pose_add)
+
+
+def foot_load_balance(
+    left_force: torch.Tensor,
+    right_force: torch.Tensor,
+    min_total: float = 1.0,
+) -> torch.Tensor:
+    """1 when both feet share the load, 0 when one foot carries it or neither touches.
+
+    Run 94 kept the knees symmetric and still fell: from step 15 the left sole
+    held about 6 N and the right sole held 0 N while that foot rose to 44 mm.
+    """
+    total = left_force + right_force
+    even = 1.0 - torch.abs(left_force - right_force) / total.clamp(min=1e-6)
+    return torch.where(total > min_total, even, torch.zeros_like(total))
+
+
+def foot_gap_potential_delta(
+    gap: torch.Tensor,
+    prev_phi: torch.Tensor,
+    active: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Potential Φ = −(foot-height gap) only while the landing gate is on.
+
+    Closing the gap pays once. Holding it pays nothing. Opening it costs.
+    An inactive step stores Φ = 0 and pays 0, so a staggered touchdown cannot
+    collect a gap that accumulated while the gate was off, and a new episode
+    cannot refund the previous episode's potential.
+    """
+    phi = torch.where(active, -gap, torch.zeros_like(gap))
+    delta = torch.where(active, phi - prev_phi, torch.zeros_like(phi))
+    return delta, phi
+
+
+def jump_foot_gap_shaping(
+    env: ManagerBasedRlEnv,
+    min_step: int = 14,
+    max_step: int = 30,
+    sensor_name: str = "feet_ground_contact",
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Pay for bringing the feet to the same height after the jump has started.
+
+    The one-foot landing shows up as a height gap while roll is still near 0,
+    which is earlier than the 20° termination. Paying the change in the
+    potential does not reward oscillating the gap.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    if not hasattr(env, "_foot_site_ids"):
+        env._foot_site_ids = [
+            asset.site_names.index("left_foot"),
+            asset.site_names.index("right_foot"),
+        ]
+    feet_z = asset.data.site_pos_w[:, env._foot_site_ids, 2]
+    gap = torch.abs(feet_z[:, 0] - feet_z[:, 1])
+
+    step_count = env.episode_length_buf
+    in_window = (step_count >= min_step) & (step_count <= max_step)
+    if (not hasattr(env, "_foot_gap_phi")) or env._foot_gap_phi.shape[0] != gap.shape[0]:
+        env._foot_gap_phi = torch.zeros_like(gap)
+
+    from mjlab.sensor import ContactSensor
+    sensor: ContactSensor = env.scene[sensor_name]
+    has_jumped = torch.min(sensor.data.last_air_time, dim=-1).values > 0.04
+
+    # Gate the potential itself. Masking only the returned delta let Φ keep
+    # tracking a one-foot gap, then paid that gap back when the late foot landed.
+    active = in_window & has_jumped
+    delta, phi = foot_gap_potential_delta(gap, env._foot_gap_phi, active)
+    env._foot_gap_phi = phi.detach()
+    return torch.nan_to_num(delta, nan=0.0)
+
+
+def jump_landing_cushion_reward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    min_step: int = 16,
+    max_step: int = 30,
+    target_cushion_z: float = 0.100,
+    std_cushion_z: float = 0.025,
+    min_knee_flexion: float = 0.55,
+    knee_sym_std: float = 0.40,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Phase 3: Compliant shock-absorbing cushion on landing (t in 0.32s - 0.80s).
+
+    Upon touching down, the robot flexes its knees and slightly lowers its trunk
+    (Z ~ 0.100m, between squat 0.075m and standing 0.118m) to absorb impact smoothly.
+    Smoothly fades out between step 30 and 40 as the rise-to-stand phase takes over.
+
+    Anti-camping gate: Can ONLY be earned if BOTH feet were airborne for at least 0.04s.
+    """
+    step_count = env.episode_length_buf
+    # Active from min_step with smooth fade-out between step 30 and max_step (40)
+    fade = torch.clamp((float(max_step) - step_count.float()) / 10.0, min=0.0, max=1.0)
+    active = (step_count >= min_step).float() * fade
+
+    from mjlab.sensor import ContactSensor
+    sensor: ContactSensor = env.scene[sensor_name]
+    feet_force_mag = torch.norm(torch.nan_to_num(sensor.data.force, nan=0.0), dim=-1)
+    # Any-foot contact let Run 94 farm the cushion while standing on the left sole.
+    load_balance = foot_load_balance(feet_force_mag[:, 0], feet_force_mag[:, 1])
+
+    # Has jumped: BOTH feet must have logged air time
+    has_jumped = (torch.min(sensor.data.last_air_time, dim=-1).values > 0.04).float()
+
+    asset: Entity = env.scene[asset_cfg.name]
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2],
+        nan=0.0,
+    )
+    z_score = torch.exp(-torch.square(z - target_cushion_z) / (std_cushion_z ** 2))
+
+    # Signed symmetric flexion. abs() let one deep knee farm the term while the
+    # other leg straightened and rolled the body over before the rise reward.
+    joint_pos = _servo_joint_pos(env, asset)
+    knee_score = symmetric_knee_flexion_score(
+        joint_pos[:, 3],
+        joint_pos[:, 12],
+        target=min_knee_flexion,
+        sym_std=knee_sym_std,
+    )
+
+    # Upright check: pitch and roll should stay near 0
+    quat = asset.data.root_link_quat_w
+    cos_tilt = 1.0 - 2.0 * (quat[:, 1] ** 2 + quat[:, 2] ** 2)
+    upright = torch.clamp(cos_tilt, min=0.0)
+
+    reward = active * has_jumped * load_balance * upright * knee_score * z_score
+    return torch.nan_to_num(reward, nan=0.0)
+
+
+def jump_landing_rise_reward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    min_step: int = 16,
+    ramp_steps: int = 34,
+    target_stand_z: float = 0.118,
+    std_stand_z: float = 0.025,
+    target_stand_knee: float = 0.0,
+    std_stand_knee: float = 0.60,
+    cushion_init_z: float = 0.100,
+    cushion_init_knee: float = 0.55,
+    target_stand_ankle: float = 0.4530,
+    std_stand_ankle: float = 0.20,
+    cushion_init_ankle: float = 0.30,
+    target_stand_hip: float = 0.4579,
+    std_stand_hip: float = 0.50,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Phase 4: Slewed transition from touchdown to standing pose (t >= 0.32s).
+
+    Run 93/94 died around step 27, and this reward used to start at step 28, so
+    the stand target was never on-policy. It now starts at touchdown (step 16)
+    and slews knee/height/ankle through step 50. Straightening ahead of the slew
+    scores worse than holding the cushion knee, which is what Run 94 did at
+    step 27 when the left knee dumped and the body rolled over.
+
+    Targets are linearly slewed between min_step (16, 0.32s) and
+    min_step + ramp_steps (50, 1.00s).
+
+    Anti-camping gate: Can ONLY be earned if BOTH feet have actually jumped.
+    Anti-shuffling gate: Requires continuous bilateral ground contact (both feet bearing weight).
+    """
+    step_count = env.episode_length_buf
+    active = (step_count >= min_step).float()
+
+    from mjlab.sensor import ContactSensor
+    sensor: ContactSensor = env.scene[sensor_name]
+    feet_force_mag = torch.norm(torch.nan_to_num(sensor.data.force, nan=0.0), dim=-1)
+    # Bilateral contact score: both feet must bear weight to stop foot-shuffling chatter
+    min_foot_force = torch.min(feet_force_mag, dim=-1).values
+    both_down = torch.clamp(min_foot_force / 2.0, min=0.0, max=1.0)
+
+    has_jumped = (torch.min(sensor.data.last_air_time, dim=-1).values > 0.04).float()
+
+    # Slewed target progression: 0.0 at min_step -> 1.0 at min_step + ramp_steps
+    progress = torch.clamp(
+        (step_count.float() - float(min_step)) / float(ramp_steps), min=0.0, max=1.0
+    )
+    current_target_z = cushion_init_z + progress * (target_stand_z - cushion_init_z)
+    current_target_knee = cushion_init_knee * (1.0 - progress) + target_stand_knee * progress
+    current_target_ankle = cushion_init_ankle * (1.0 - progress) + target_stand_ankle * progress
+
+    asset: Entity = env.scene[asset_cfg.name]
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2],
+        nan=0.0,
+    )
+    z_score = torch.exp(-torch.square(z - current_target_z) / (std_stand_z ** 2))
+
+    # Knee tracking relative to slewed knee target
+    joint_pos = _servo_joint_pos(env, asset)
+    knee_err = 0.5 * (
+        torch.square(joint_pos[:, 3] - current_target_knee)
+        + torch.square(joint_pos[:, 12] - (-current_target_knee))
+    )
+    knee_score = torch.exp(-knee_err / (std_stand_knee ** 2))
+
+    # Ankle tracking relative to slewed ankle target (left +target, right -target)
+    ankle_err = 0.5 * (
+        torch.square(joint_pos[:, 4] - current_target_ankle)
+        + torch.square(joint_pos[:, 13] - (-current_target_ankle))
+    )
+    ankle_score = torch.exp(-ankle_err / (std_stand_ankle ** 2))
+
+    # Low velocity in standing: allow gentle motion during rise, damp jitter at rest
+    vz = asset.data.root_link_lin_vel_w[:, 2]
+    vel_score = torch.exp(-torch.square(vz) / (0.20 ** 2))
+
+    quat = asset.data.root_link_quat_w
+    cos_tilt = 1.0 - 2.0 * (quat[:, 1] ** 2 + quat[:, 2] ** 2)
+    upright = torch.clamp(cos_tilt, min=0.0)
+
+    # Pose composite ensures non-zero gradient even if one factor lags.
+    # After the slew, hip pitch joins that average. Multiplying by the hip
+    # score cut the parked landing in half and falls climbed before the hip moved.
+    pose_add = (z_score + knee_score + ankle_score) / 3.0
+    hip_score = symmetric_hip_pitch_score(
+        joint_pos[:, 2],
+        joint_pos[:, 11],
+        target=target_stand_hip,
+        std=std_stand_hip,
+    )
+    pose_score = stand_pose_with_hip(pose_add, hip_score, progress >= 1.0)
+
+    reward = active * has_jumped * both_down * upright * pose_score * vel_score
+    return torch.nan_to_num(reward, nan=0.0)
+
+
+def jump_rebound_hop_penalty(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    min_step: int = 24,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Penalize any feet liftoff (airborne) occurring after the primary jump (t >= 0.48s).
+
+    This strictly enforces a single, clean jump: once the robot has landed,
+    any subsequent hopping or bouncing is penalised.
+
+    Returns >= 0 (standard mjlab cost function); use with negative weight.
+    """
+    step_count = env.episode_length_buf
+    active = (step_count >= min_step).float()
+
+    asset: Entity = env.scene[asset_cfg.name]
+    vz = asset.data.root_link_lin_vel_w[:, 2]
+
+    from mjlab.sensor import ContactSensor
+    sensor: ContactSensor = env.scene[sensor_name]
+    feet_force_mag = torch.norm(torch.nan_to_num(sensor.data.force, nan=0.0), dim=-1)
+    any_contact = torch.any(feet_force_mag > 1.0, dim=-1)
+    airborne = ~any_contact
+
+    vz_up = torch.clamp(vz, min=0.0)
+    # Cost fires if airborne after landing, scaled higher if thrusting up again
+    cost = active * airborne.float() * (1.0 + vz_up * 3.0)
+    return torch.nan_to_num(cost, nan=0.0)
+
+
+def jump_impact_penalty(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Penalize high-impact landings (large downward velocity at foot touchdown).
+
+    Discourages ballistic crashes by penalizing |Vz| at the moment of foot contact.
+    Returns >= 0 (standard mjlab cost function); use with negative weight.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    vz = asset.data.root_link_lin_vel_w[:, 2]  # (N,)
+
+    from mjlab.sensor import ContactSensor
+    sensor: ContactSensor = env.scene[sensor_name]
+    feet_force_mag = torch.norm(torch.nan_to_num(sensor.data.force, nan=0.0), dim=-1)
+    any_contact = torch.any(feet_force_mag > 1.0, dim=-1)
+
+    # Penalize negative Vz (downward) when in contact — heavy landing
+    vz_down = torch.clamp(-vz, min=0.0)  # (N,) only downward velocity
+    cost = any_contact.float() * torch.square(vz_down) * 3.0
+    return torch.nan_to_num(cost, nan=0.0)
+
+
+def jump_anti_tiptoe_penalty(
+    env: ManagerBasedRlEnv,
+    max_plantar_flexion_deg: float = 35.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Penalize excessive plantar-flexion tiptoeing and ankle asymmetry.
+
+    Stops the robot from rolling on tiptoes or using one foot as a ground pivot
+    while the other lifts off.
+    Returns >= 0; use with negative weight.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    joint_pos = _servo_joint_pos(env, asset)
+
+    # Ankle joints: 4 (left), 13 (right). Signs are opposite: left + is extension, right - is extension.
+    # Symmetry: sum should be near zero.
+    ankle_asym = torch.abs(joint_pos[:, 4] + joint_pos[:, 13])
+
+    # Excessive tiptoe threshold (35 deg = 0.61 rad)
+    thresh = math.radians(max_plantar_flexion_deg)
+    l_tiptoe = torch.clamp(torch.abs(joint_pos[:, 4]) - thresh, min=0.0)
+    r_tiptoe = torch.clamp(torch.abs(joint_pos[:, 13]) - thresh, min=0.0)
+
+    cost = ankle_asym * 2.0 + (l_tiptoe + r_tiptoe) * 3.0
+    return torch.nan_to_num(cost, nan=0.0)
 
 
