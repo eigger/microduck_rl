@@ -754,7 +754,7 @@ class PolicyInference:
 
         jpos_rel = self.get_joint_pos_relative()
         jvel = self.get_joint_vel()
-        if self.current_policy == "jump":
+        if self.current_policy == "jump" and getattr(self, "zero_head_obs_for_jump", True):
             # Jump was trained from HOME_FRAME with head locked neutral (head_neutral
             # penalty -50, head_action_l2 -30). The settled standing neck tilt
             # (-0.12 rad) is a ~12-sigma OOD outlier that saturates the policy's

@@ -8207,18 +8207,51 @@ def jump_yaw_penalty(
     return torch.nan_to_num(cost, nan=0.0)
 
 
+def yaw_from_quat(quat: torch.Tensor) -> torch.Tensor:
+    w, x, y, z = quat.unbind(-1)
+    return torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+
+def spawn_frame_offset(
+    start_xy: torch.Tensor, start_yaw: torch.Tensor, vec_xy: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(forward, left) components of vec_xy in the spawn heading frame."""
+    c, s = torch.cos(start_yaw), torch.sin(start_yaw)
+    d = vec_xy - start_xy
+    return c * d[:, 0] + s * d[:, 1], -s * d[:, 0] + c * d[:, 1]
+
+
+def _jump_spawn_frame(env: ManagerBasedRlEnv, asset: Entity):
+    """Trunk xy and yaw latched at the first step of each episode.
+
+    reset_base spawns at ±0.5 m and any yaw, so env_origins and world x say
+    nothing about how far or which way the robot travelled.
+    """
+    xy = asset.data.root_link_pos_w[:, :2]
+    yaw = yaw_from_quat(asset.data.root_link_quat_w)
+    if (not hasattr(env, "_jump_spawn_xy")) or env._jump_spawn_xy.shape != xy.shape:
+        env._jump_spawn_xy = xy.detach().clone()
+        env._jump_spawn_yaw = yaw.detach().clone()
+    fresh = env.episode_length_buf <= 1
+    env._jump_spawn_xy = torch.where(fresh.view(-1, 1), xy.detach(), env._jump_spawn_xy)
+    env._jump_spawn_yaw = torch.where(fresh, yaw.detach(), env._jump_spawn_yaw)
+    return env._jump_spawn_xy, env._jump_spawn_yaw, xy, yaw
+
+
 def jump_lateral_drift_penalty(
     env: ManagerBasedRlEnv,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Penalize sideways (lateral Y-axis) velocity and displacement from spawn origin.
-    
-    Keeps the jump strictly vertical and on the centerline without drifting sideways.
+    """Penalize sideways velocity and displacement from the spawn spot, in the spawn heading frame.
+
     Returns >= 0 (standard mjlab cost function); use with negative weight.
     """
     asset: Entity = env.scene[asset_cfg.name]
-    vy = asset.data.root_link_lin_vel_w[:, 1]
-    y_drift = asset.data.root_link_pos_w[:, 1] - env.scene.env_origins[:, 1]
+    start_xy, start_yaw, xy, _ = _jump_spawn_frame(env, asset)
+    _, y_drift = spawn_frame_offset(start_xy, start_yaw, xy)
+    _, vy = spawn_frame_offset(
+        torch.zeros_like(xy), start_yaw, asset.data.root_link_lin_vel_w[:, :2]
+    )
     cost = torch.square(vy) * 2.0 + torch.square(y_drift) * 10.0 + torch.abs(y_drift) * 1.0
     return torch.nan_to_num(cost, nan=0.0)
 
@@ -8227,20 +8260,120 @@ def jump_sagittal_drift_penalty(
     env: ManagerBasedRlEnv,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Penalize forward/backward displacement and forward velocity to enforce vertical takeoff.
-    
-    Specifically penalizes:
-    - vx**2 (horizontal longitudinal velocity)
-    - (x - x_origin)**2 (displacement from origin)
-    - max(0, x - x_origin) (asymmetric penalty for forward leaping)
+    """Penalize forward/backward displacement from the spawn spot and forward velocity,
+    in the spawn heading frame, with extra cost for forward leaping.
+
     Returns >= 0 (standard mjlab cost function); use with negative weight.
     """
     asset: Entity = env.scene[asset_cfg.name]
-    v_x = asset.data.root_link_lin_vel_w[:, 0]
-    dx = asset.data.root_link_pos_w[:, 0] - env.scene.env_origins[:, 0]
-    
+    start_xy, start_yaw, xy, _ = _jump_spawn_frame(env, asset)
+    dx, _ = spawn_frame_offset(start_xy, start_yaw, xy)
+    v_x, _ = spawn_frame_offset(
+        torch.zeros_like(xy), start_yaw, asset.data.root_link_lin_vel_w[:, :2]
+    )
     forward_bias = torch.clamp(dx, min=0.0)
     cost = torch.square(v_x) * 2.0 + torch.square(dx) * 15.0 + torch.abs(dx) * 2.0 + forward_bias * 10.0
+    return torch.nan_to_num(cost, nan=0.0)
+
+
+def jump_yaw_drift_penalty(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """|trunk yaw - spawn yaw| (rad). Run 105 turned 12° in flight.
+
+    Returns >= 0 (standard mjlab cost function); use with negative weight.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    _, start_yaw, _, yaw = _jump_spawn_frame(env, asset)
+    err = torch.atan2(torch.sin(yaw - start_yaw), torch.cos(yaw - start_yaw))
+    return torch.nan_to_num(torch.abs(err), nan=0.0)
+
+
+def foot_offset_cost(start_xy: torch.Tensor, now_xy: torch.Tensor) -> torch.Tensor:
+    """Sum over both feet of horizontal distance from where each foot started."""
+    return torch.linalg.norm(now_xy - start_xy, dim=-1).sum(dim=-1)
+
+
+def jump_foot_landing_offset_penalty(
+    env: ManagerBasedRlEnv,
+    min_step: int = 14,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Cost for feet ending up away from their takeoff spot.
+
+    Run 101 dragged both feet back 18 mm during the push, swung them forward
+    in the air, and landed them +12 / +18 mm ahead. On video that reads as
+    stepping a foot forward, not a jump. Trunk drift alone did not price it.
+
+    Returns >= 0 (standard mjlab cost function); use with negative weight.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    if not hasattr(env, "_foot_site_ids"):
+        env._foot_site_ids = [
+            asset.site_names.index("left_foot"),
+            asset.site_names.index("right_foot"),
+        ]
+    feet_xy = asset.data.site_pos_w[:, env._foot_site_ids, :2]
+    step_count = env.episode_length_buf
+    if (not hasattr(env, "_foot_start_xy")) or env._foot_start_xy.shape != feet_xy.shape:
+        env._foot_start_xy = feet_xy.detach().clone()
+    fresh = step_count <= 1
+    env._foot_start_xy = torch.where(
+        fresh.view(-1, 1, 1), feet_xy.detach(), env._foot_start_xy
+    )
+    active = (step_count >= min_step).float()
+    cost = active * foot_offset_cost(env._foot_start_xy, feet_xy)
+    return torch.nan_to_num(cost, nan=0.0)
+
+
+def foot_slip_cost(
+    prev_xy: torch.Tensor,
+    now_xy: torch.Tensor,
+    feet_z: torch.Tensor,
+    floor_z: torch.Tensor,
+    max_height: float,
+    dt: float,
+) -> torch.Tensor:
+    """Sum of horizontal foot speeds (m/s) over feet within max_height of the floor."""
+    speed = torch.linalg.norm(now_xy - prev_xy, dim=-1) / dt
+    low = (feet_z - floor_z.unsqueeze(-1)) < max_height
+    return (speed * low.float()).sum(dim=-1)
+
+
+def jump_foot_slip_penalty(
+    env: ManagerBasedRlEnv,
+    max_step: int = 14,
+    max_height: float = 0.004,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Cost for horizontal foot speed below max_height up to max_step.
+
+    Runs 103-106 hopped ~7 mm at steps 4-6, swept the feet back ~22 mm
+    (0.4 m/s), re-landed on the toes, and pushed off with the feet behind the
+    CoM, which threw the body forward.
+
+    Returns >= 0 (standard mjlab cost function); use with negative weight.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    if not hasattr(env, "_foot_site_ids"):
+        env._foot_site_ids = [
+            asset.site_names.index("left_foot"),
+            asset.site_names.index("right_foot"),
+        ]
+    feet = asset.data.site_pos_w[:, env._foot_site_ids, :]
+    now_xy = feet[..., :2]
+    step_count = env.episode_length_buf
+    if (not hasattr(env, "_foot_slip_prev_xy")) or env._foot_slip_prev_xy.shape != now_xy.shape:
+        env._foot_slip_prev_xy = now_xy.detach().clone()
+    fresh = (step_count <= 1).view(-1, 1, 1)
+    prev_xy = torch.where(fresh, now_xy.detach(), env._foot_slip_prev_xy)
+    env._foot_slip_prev_xy = now_xy.detach().clone()
+    active = (step_count <= max_step).float()
+    cost = active * foot_slip_cost(
+        prev_xy, now_xy, feet[..., 2], env.scene.terrain.env_origins[:, 2],
+        max_height, env.step_dt,
+    )
     return torch.nan_to_num(cost, nan=0.0)
 
 
@@ -8340,7 +8473,9 @@ def squat_to_jump_pose_reward(
     err_leg = err[:, leg_idx]      # (N, 10)
     std_leg = std[leg_idx]         # (10,)
     gauss = torch.exp(-torch.square(err_leg) / (std_leg ** 2))  # (N, 10)
-    return active * gauss.mean(dim=1)
+    # Stand-curriculum spawns are already past the launch. This term would
+    # drag them back into the jump pose for the first 14 steps.
+    return active * gauss.mean(dim=1) * (1.0 - _stand_curriculum_mask(env))
 
 
 def jump_pose_height_reward(
@@ -8380,11 +8515,31 @@ def jump_pose_height_reward(
 # and completely eliminating rebound hopping.
 # ---------------------------------------------------------------------------
 
+def feet_above_floor(feet_z: torch.Tensor, floor_z: torch.Tensor, min_lift: float) -> torch.Tensor:
+    """True when every foot site is at least min_lift above the floor."""
+    return torch.min(feet_z, dim=-1).values - floor_z >= min_lift
+
+
+def _jump_feet_lifted(
+    env: ManagerBasedRlEnv, asset: Entity, min_lift: float
+) -> torch.Tensor:
+    if min_lift <= 0.0:
+        return torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+    if not hasattr(env, "_foot_site_ids"):
+        env._foot_site_ids = [
+            asset.site_names.index("left_foot"),
+            asset.site_names.index("right_foot"),
+        ]
+    feet_z = asset.data.site_pos_w[:, env._foot_site_ids, 2]
+    return feet_above_floor(feet_z, env.scene.terrain.env_origins[:, 2], min_lift)
+
+
 def jump_takeoff_vz_reward(
     env: ManagerBasedRlEnv,
     sensor_name: str = "feet_ground_contact",
     vz_scale: float = 4.0,
     max_step: int = 18,
+    min_foot_lift: float = 0.0,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """Reward positive vertical velocity when BOTH feet are fully airborne during launch window.
@@ -8394,10 +8549,14 @@ def jump_takeoff_vz_reward(
 
     Bilateral Contact Check: Both feet must have detached from the ground.
     Fixes the one-foot tiptoe cheat where index 0 was airborne while index 1 pushed the ground.
+
+    min_foot_lift: Run 103 read < 1 N while the feet slid back 16 mm at
+    0 mm height, and was paid for that extension as flight.
     """
     active = (env.episode_length_buf <= max_step).float()
 
     asset: Entity = env.scene[asset_cfg.name]
+    lifted = _jump_feet_lifted(env, asset, min_foot_lift).float()
     vz = asset.data.root_link_lin_vel_w[:, 2]  # (N,) world-frame Z velocity
 
     from mjlab.sensor import ContactSensor
@@ -8408,7 +8567,7 @@ def jump_takeoff_vz_reward(
     both_airborne = ~any_contact                             # (N,) True if BOTH feet off ground
 
     vz_positive = torch.clamp(vz, min=0.0)             # (N,) only rising phase counts
-    reward = active * both_airborne.float() * vz_positive * vz_scale
+    reward = active * both_airborne.float() * lifted * vz_positive * vz_scale
     return torch.nan_to_num(reward, nan=0.0)
 
 
@@ -8418,6 +8577,7 @@ def jump_peak_height_reward(
     target_z: float = 0.150,
     std_z: float = 0.025,
     max_step: int = 24,
+    min_foot_lift: float = 0.0,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """Gaussian reward for trunk height above target while BOTH feet are airborne in apex window.
@@ -8441,7 +8601,8 @@ def jump_peak_height_reward(
 
     err_z = z - target_z
     gauss = torch.exp(-torch.square(err_z) / (std_z ** 2))
-    return active * both_airborne.float() * gauss
+    lifted = _jump_feet_lifted(env, asset, min_foot_lift).float()
+    return active * both_airborne.float() * lifted * gauss
 
 
 def jump_foot_clearance_reward(
@@ -8450,6 +8611,7 @@ def jump_foot_clearance_reward(
     min_step: int = 6,
     max_step: int = 18,
     target_clearance: float = 0.035,
+    ground_offset: float = 0.008,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """Phase 2 Aerial Flight: Reward foot clearance (distance above ground) while both feet are airborne.
@@ -8476,8 +8638,7 @@ def jump_foot_clearance_reward(
     feet_z = asset.data.site_pos_w[:, env._foot_site_ids, 2]
     min_foot_z = torch.min(feet_z, dim=-1).values
     terrain_z = env.scene.terrain.env_origins[:, 2]
-    # Ground baseline at rest is ~0.008m
-    clearance = torch.clamp(min_foot_z - terrain_z - 0.008, min=0.0)
+    clearance = torch.clamp(min_foot_z - terrain_z - ground_offset, min=0.0)
 
     # Score ramps up linearly to target_clearance (35mm) and clamps at 1.5
     clearance_score = torch.clamp(clearance / max(1e-4, target_clearance), min=0.0, max=1.5)
@@ -8532,17 +8693,19 @@ def symmetric_hip_pitch_score(
 def stand_pose_with_hip(
     pose_add: torch.Tensor,
     hip_score: torch.Tensor,
-    slew_done: torch.Tensor,
+    hip_scale: torch.Tensor,
 ) -> torch.Tensor:
-    """Fold hip pitch into the stand score without cutting the current landing.
+    """Add hip pitch on top of the pose. Do not average it in, and do not multiply.
 
-    Multiplying the whole pose by the hip score halved Run 96's late reward
-    and falls rose from 5 to 43 before the hip moved. After the slew, the hip
-    is one more term in the average, so the parked pose keeps most of its score
-    and the wrong-sign hip still has a slope.
+    Multiplying by the hip score halved Run 96's late reward and falls rose
+    from 5 to 43. Averaging it in as one of four terms, and only after step 50,
+    left Run 98's right hip at −12° for 2100 iterations: a full correction was
+    worth about 0.16 on the pose, and the crouch had already frozen.
+    ``hip_scale`` is 0 at touchdown and 1 when the slew ends, so the landing
+    score is unchanged at contact and the wrong-sign hip is a full extra term
+    by the time the stand target has arrived.
     """
-    with_hip = (pose_add * 3.0 + hip_score) / 4.0
-    return torch.where(slew_done, with_hip, pose_add)
+    return pose_add + hip_scale * hip_score
 
 
 def foot_load_balance(
@@ -8675,6 +8838,89 @@ def jump_landing_cushion_reward(
     return torch.nan_to_num(reward, nan=0.0)
 
 
+def _stand_curriculum_mask(env: ManagerBasedRlEnv) -> torch.Tensor:
+    """1 on resets that spawned in the post-landing crouch→stand blend."""
+    n = env.num_envs
+    mask = getattr(env, "_stand_now", None)
+    if mask is None or mask.shape[0] != n:
+        return torch.zeros(n, device=env.device)
+    return mask
+
+
+# Run 99 parked landing, servo order. Right hip pitch is still the wrong sign.
+_RUN99_CROUCH_SERVO = (
+    0.0, 0.0, -0.527, 0.784, 0.349,
+    0.3491, 0.3491, 0.0, 0.0,
+    0.0, 0.0, -0.216, -0.644, -0.349,
+)
+# HOME stand. Right hip pitch is +26°.
+_HOME_STAND_SERVO = (
+    0.0, -0.0873, -0.4579, -0.0049, 0.4530,
+    0.3491, 0.3491, 0.0, 0.0,
+    0.0, 0.0873, 0.4579, 0.0049, -0.4530,
+)
+
+
+def stand_curriculum_joints(alpha: torch.Tensor) -> torch.Tensor:
+    """Blend Run 99's parked crouch (alpha 0) into the HOME stand (alpha 1)."""
+    crouch = torch.tensor(_RUN99_CROUCH_SERVO, device=alpha.device, dtype=alpha.dtype)
+    stand = torch.tensor(_HOME_STAND_SERVO, device=alpha.device, dtype=alpha.dtype)
+    a = alpha.reshape(-1, 1)
+    return crouch + a * (stand - crouch)
+
+
+def reset_stand_curriculum(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor | None = None,
+    fraction: float = 0.25,
+    crouch_z: float = 0.096,
+    stand_z: float = 0.1185,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> None:
+    """Spawn some episodes between the measured crouch and the stand.
+
+    Run 98 and Run 99 landed and then held Z ≈ 96 mm with the right hip at
+    −12° for the whole rise window. That state was never a reset, so the
+    policy never practiced leaving it. These episodes are marked already
+    jumped and already past the slew, and the launch reward is off.
+    """
+    if env_ids is None:
+        env_ids = torch.arange(env.num_envs, device=env.device)
+    if len(env_ids) == 0:
+        return
+    env_ids = env_ids.to(env.device)
+
+    n_env = env.num_envs
+    if (not hasattr(env, "_stand_now")) or env._stand_now.shape[0] != n_env:
+        env._stand_now = torch.zeros(n_env, device=env.device)
+    env._stand_now[env_ids] = 0.0
+    if fraction <= 0.0:
+        return
+
+    n_pick = max(1, int(len(env_ids) * fraction))
+    perm = torch.randperm(len(env_ids), device=env.device)[:n_pick]
+    warm_ids = env_ids[perm]
+    alpha = torch.rand(n_pick, device=env.device)
+    joints = stand_curriculum_joints(alpha)
+
+    asset: Entity = env.scene[asset_cfg.name]
+    servo_ids = _servo_joint_ids(env, asset)
+    joint_pos = asset.data.joint_pos[warm_ids].clone()
+    joint_vel = torch.zeros_like(joint_pos)
+    joint_pos[:, servo_ids] = joints
+    asset.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=warm_ids)
+
+    q_adr = asset.data.indexing.free_joint_q_adr
+    root = asset.data.data.qpos[warm_ids][:, q_adr].clone()
+    z = crouch_z + alpha * (stand_z - crouch_z)
+    root[:, 2] = env.scene.terrain.env_origins[warm_ids, 2] + z
+    asset.write_root_link_pose_to_sim(root[:, :7], warm_ids)
+    asset.write_root_link_velocity_to_sim(
+        torch.zeros(n_pick, 6, device=env.device), warm_ids
+    )
+    env._stand_now[warm_ids] = 1.0
+
+
 def jump_landing_rise_reward(
     env: ManagerBasedRlEnv,
     sensor_name: str = "feet_ground_contact",
@@ -8719,10 +8965,15 @@ def jump_landing_rise_reward(
 
     has_jumped = (torch.min(sensor.data.last_air_time, dim=-1).values > 0.04).float()
 
-    # Slewed target progression: 0.0 at min_step -> 1.0 at min_step + ramp_steps
+    # Slewed target progression: 0.0 at min_step -> 1.0 at min_step + ramp_steps.
+    # Curriculum spawns are already at the stand target, from step 0.
     progress = torch.clamp(
         (step_count.float() - float(min_step)) / float(ramp_steps), min=0.0, max=1.0
     )
+    stand_now = _stand_curriculum_mask(env)
+    has_jumped = torch.maximum(has_jumped, stand_now)
+    active = torch.maximum(active, stand_now)
+    progress = torch.maximum(progress, stand_now)
     current_target_z = cushion_init_z + progress * (target_stand_z - cushion_init_z)
     current_target_knee = cushion_init_knee * (1.0 - progress) + target_stand_knee * progress
     current_target_ankle = cushion_init_ankle * (1.0 - progress) + target_stand_ankle * progress
@@ -8758,8 +9009,8 @@ def jump_landing_rise_reward(
     upright = torch.clamp(cos_tilt, min=0.0)
 
     # Pose composite ensures non-zero gradient even if one factor lags.
-    # After the slew, hip pitch joins that average. Multiplying by the hip
-    # score cut the parked landing in half and falls climbed before the hip moved.
+    # Hip pitch is added on top, scaled by the slew. It is 0 at touchdown
+    # (landing score unchanged) and a full extra term at step 50.
     pose_add = (z_score + knee_score + ankle_score) / 3.0
     hip_score = symmetric_hip_pitch_score(
         joint_pos[:, 2],
@@ -8767,7 +9018,7 @@ def jump_landing_rise_reward(
         target=target_stand_hip,
         std=std_stand_hip,
     )
-    pose_score = stand_pose_with_hip(pose_add, hip_score, progress >= 1.0)
+    pose_score = stand_pose_with_hip(pose_add, hip_score, progress)
 
     reward = active * has_jumped * both_down * upright * pose_score * vel_score
     return torch.nan_to_num(reward, nan=0.0)

@@ -7,11 +7,19 @@ Verifies:
 4. Large penalty on asymmetric 'one-knee-bent, one-knee-extended' failure mode.
 """
 
+import math
+
 import torch
 
 from mjlab_microduck.tasks.mdp import (
     foot_gap_potential_delta,
     foot_load_balance,
+    feet_above_floor,
+    foot_offset_cost,
+    foot_slip_cost,
+    spawn_frame_offset,
+    yaw_from_quat,
+    stand_curriculum_joints,
     stand_pose_with_hip,
     symmetric_hip_pitch_score,
     symmetric_knee_flexion_score,
@@ -137,12 +145,79 @@ def test_run96_right_hip_fold_is_on_the_stand_slope():
     )
     assert float(matched) > 0.99
     assert 0.25 < float(held) < 0.70
-    # The parked landing (pose ~0.56, hip ~0.44) must keep most of its score.
-    # Multiplying by the hip score dropped it to 0.25 and falls rose 5 → 43.
-    parked = stand_pose_with_hip(
-        torch.tensor([0.56]), torch.tensor([0.44]), torch.tensor([True])
+    # Adding the hip must not cut the parked pose. Averaging it in left the
+    # right hip at −12° for all of Run 98. Multiplying cut the pose in half
+    # and falls rose 5 → 43.
+    at_contact = stand_pose_with_hip(
+        torch.tensor([0.56]), torch.tensor([0.44]), torch.tensor([0.0])
     )
-    assert float(parked) > 0.85 * 0.56
+    parked = stand_pose_with_hip(
+        torch.tensor([0.56]), torch.tensor([0.44]), torch.tensor([1.0])
+    )
+    stood = stand_pose_with_hip(
+        torch.tensor([0.56]), torch.tensor([1.0]), torch.tensor([1.0])
+    )
+    assert abs(float(at_contact) - 0.56) < 1e-5
+    assert float(parked) > 0.56
+    assert float(stood) > float(parked)
+
+
+def test_run101_forward_landing_costs_more_than_planted():
+    """Run 101 landed the feet +12 mm and +18 mm ahead of takeoff."""
+    start = torch.tensor([[[0.0, 0.042], [0.0, -0.042]]])
+    planted = foot_offset_cost(start, start.clone())
+    forward = foot_offset_cost(
+        start, torch.tensor([[[0.012, 0.042], [0.018, -0.042]]])
+    )
+    assert float(planted) == 0.0
+    assert abs(float(forward) - 0.030) < 1e-6
+
+
+def test_run103_skimming_feet_are_not_flight():
+    """Run 103 steps 4-6: < 1 N contact force, feet at +0.1 / -1.2 mm."""
+    floor = torch.zeros(3)
+    feet_z = torch.tensor([[0.0001, -0.0012], [0.0103, 0.0110], [0.0118, 0.002]])
+    lifted = feet_above_floor(feet_z, floor, 0.004)
+    assert lifted.tolist() == [False, True, False]
+
+
+def test_drift_is_measured_from_spawn_in_its_heading():
+    """reset_base spawns at ±0.5 m and any yaw. A robot spawned at (0.4, -0.3)
+    facing +y that hops 30 mm forward has moved +30 mm forward, 0 sideways.
+    """
+    start = torch.tensor([[0.4, -0.3]])
+    yaw = torch.tensor([math.pi / 2])
+    fwd, left = spawn_frame_offset(start, yaw, torch.tensor([[0.4, -0.27]]))
+    assert abs(float(fwd) - 0.03) < 1e-6
+    assert abs(float(left)) < 1e-6
+    half = math.sin(math.radians(-6.0)), math.cos(math.radians(-6.0))
+    q = torch.tensor([[half[1], 0.0, 0.0, half[0]]])
+    assert abs(math.degrees(float(yaw_from_quat(q))) + 12.0) < 1e-4
+
+
+def test_run106_floor_slide_costs_but_flight_swing_does_not():
+    """Run 106 step 6: feet at +0.6 mm moved 9.6 mm back in one step.
+    Step 10: feet at +13 mm swung forward 14 mm (flight, not slip)."""
+    floor = torch.zeros(1)
+    prev = torch.tensor([[[-0.0056, 0.042], [-0.0058, -0.042]]])
+    slide = torch.tensor([[[-0.0152, 0.042], [-0.0148, -0.042]]])
+    low = torch.tensor([[0.0006, 0.0007]])
+    high = torch.tensor([[0.0127, 0.0143]])
+    c_slide = float(foot_slip_cost(prev, slide, low, floor, 0.004, 0.02))
+    c_flight = float(foot_slip_cost(prev, slide, high, floor, 0.004, 0.02))
+    assert abs(c_slide - (0.0096 + 0.0090) / 0.02) < 1e-4
+    assert c_flight == 0.0
+
+
+def test_run99_crouch_blends_onto_the_stand_hip():
+    """Run 99 step 50 right hip was −12°. The stand target is +26°."""
+    crouch = stand_curriculum_joints(torch.tensor([0.0]))
+    stand = stand_curriculum_joints(torch.tensor([1.0]))
+    mid = stand_curriculum_joints(torch.tensor([0.5]))
+    assert float(crouch[0, 11]) < 0.0
+    assert float(stand[0, 11]) > 0.40
+    assert float(crouch[0, 11]) < float(mid[0, 11]) < float(stand[0, 11])
+    assert abs(float(stand[0, 2]) - (-0.4579)) < 1e-4
 
 
 def test_one_foot_load_scores_zero_and_gap_opening_costs():

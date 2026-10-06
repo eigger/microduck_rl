@@ -66,6 +66,8 @@ ARMATURE_RANDOMIZATION_RANGE = (0.9, 1.1)
 IMU_ORIENTATION_RANDOMIZATION_ANGLE = 4.0
 ENCODER_BIAS_RANGE = (-0.015, 0.015)
 
+JUMP_MIN_FOOT_LIFT = 0.004  # m above floor for flight rewards; foot sites rest at 0 mm
+
 
 def make_microduck_jump_env_cfg(play: bool = False, rough: bool = False) -> ManagerBasedRlEnvCfg:
     """Create Microduck jump environment configuration."""
@@ -147,14 +149,19 @@ def make_microduck_jump_env_cfg(play: bool = False, rough: bool = False) -> Mana
         },
     )
 
-    # TAKEOFF VZ: positive upward velocity when BOTH feet are fully airborne (step <= 14)
+    # TAKEOFF VZ: positive upward velocity when BOTH feet are fully airborne (step <= 14).
+    # Summed over the air steps this is the trunk's ballistic rise. At weight 30
+    # Run 101 earned ~2.2 per episode against ~18.5 for the stand, so it tucked
+    # its feet 15 mm instead of lifting the body. Foot sites rest at 0 mm;
+    # below 4 mm the feet are still skimming the floor.
     cfg.rewards["jump_takeoff_vz"] = RewardTermCfg(
         func=microduck_mdp.jump_takeoff_vz_reward,
-        weight=30.0,
+        weight=60.0,
         params={
             "sensor_name": feet_ground_cfg.name,
             "vz_scale": 4.0,
             "max_step": 14,
+            "min_foot_lift": JUMP_MIN_FOOT_LIFT,
         },
     )
 
@@ -167,6 +174,7 @@ def make_microduck_jump_env_cfg(play: bool = False, rough: bool = False) -> Mana
             "min_step": 6,
             "max_step": 18,
             "target_clearance": 0.035,
+            "ground_offset": 0.0,
         },
     )
 
@@ -179,6 +187,7 @@ def make_microduck_jump_env_cfg(play: bool = False, rough: bool = False) -> Mana
             "target_z": 0.155,
             "std_z": 0.025,
             "max_step": 20,
+            "min_foot_lift": JUMP_MIN_FOOT_LIFT,
         },
     )
 
@@ -249,6 +258,28 @@ def make_microduck_jump_env_cfg(play: bool = False, rough: bool = False) -> Mana
         },
     )
 
+    # FOOT LANDING OFFSET: feet must come down where they took off. From step 1:
+    # Run 103 slid them 20 mm back during the push, then swung them forward.
+    # At -30 Run 104 paid ~1.3 per episode and landed +28/+15 mm ahead.
+    cfg.rewards["jump_foot_landing_offset"] = RewardTermCfg(
+        func=microduck_mdp.jump_foot_landing_offset_penalty,
+        weight=-90.0,
+        params={"min_step": 1},
+    )
+
+    # FOOT SWEEP (cost ≥ 0): horizontal foot speed through takeoff and flight.
+    # Run 106 hopped ~7 mm at steps 4-6, swept the feet 22 mm back, re-landed
+    # on its toes (site above 4 mm while touching), then swung them forward in
+    # flight. A vertical jump moves the feet only up and down, so no height
+    # gate. Smoke at -20 read -0.72 per episode; -50 puts it near -1.8.
+    # Whole episode: Run 107 stepped one foot after landing and turned 35°;
+    # rebound_hop only fires with both feet up.
+    cfg.rewards["jump_foot_slip"] = RewardTermCfg(
+        func=microduck_mdp.jump_foot_slip_penalty,
+        weight=-50.0,
+        params={"max_step": 75, "max_height": 1.0},
+    )
+
     # IMPACT: Penalize hard landings — descending velocity at foot contact
     cfg.rewards["jump_impact"] = RewardTermCfg(
         func=microduck_mdp.jump_impact_penalty,
@@ -297,10 +328,19 @@ def make_microduck_jump_env_cfg(play: bool = False, rough: bool = False) -> Mana
         weight=-3.0,
     )
 
-    # SAGITTAL drift (≤ 0): penalizes forward leaping
+    # SAGITTAL drift (≤ 0): penalizes forward leaping. Both drift terms measure
+    # from the spawn spot in the spawn heading frame; up to Run 105 they used
+    # env_origins in world axes, which reset_base offsets by ±0.5 m at any yaw.
     cfg.rewards["jump_sagittal_drift"] = RewardTermCfg(
         func=microduck_mdp.jump_sagittal_drift_penalty,
         weight=-2.0,
+    )
+
+    # YAW drift (cost ≥ 0): Run 105 turned 12° in flight, landing L +29 / R +8 mm.
+    # At -10 Run 107 still ended at median +6° (p90 +16°).
+    cfg.rewards["jump_yaw_drift"] = RewardTermCfg(
+        func=microduck_mdp.jump_yaw_drift_penalty,
+        weight=-20.0,
     )
 
     # HEAD neutral + action freeze: keeps head calm
@@ -454,6 +494,13 @@ def make_microduck_jump_env_cfg(play: bool = False, rough: bool = False) -> Mana
         mode="reset",
     )
     cfg.events["reset_base"].params["pose_range"]["z"] = (0.073, 0.077)
+    # After the squat reset: some episodes start in the measured crouch→stand
+    # blend so the rise has on-policy data. Must stay after reset_robot_joints.
+    cfg.events["reset_stand_curriculum"] = EventTermCfg(
+        func=microduck_mdp.reset_stand_curriculum,
+        mode="reset",
+        params={"fraction": 0.25},
+    )
 
     if "push_robot" in cfg.events:
         del cfg.events["push_robot"]
@@ -527,12 +574,12 @@ def make_microduck_jump_env_cfg(play: bool = False, rough: bool = False) -> Mana
         params={
             "reward_name": "action_rate_l2",
             "weight_stages": [
-                # model_17897 restores common_step_counter past 429528.
-                # The next stage is iter 21000, about 3100 iters later, so a
-                # 2500-iter resume stays at -0.05 while the stand is still missing.
+                # Run 107's model_30300 restores common_step_counter past 727200.
+                # A 2500-iter resume ends at iter 32800. Height is still short
+                # of 118.5 mm, so the tax stays at -0.05 through it.
                 {"step": 0, "weight": -0.05},
-                {"step": 21000 * 24, "weight": -0.15},
-                {"step": 23000 * 24, "weight": -0.30},
+                {"step": 33000 * 24, "weight": -0.15},
+                {"step": 35000 * 24, "weight": -0.30},
             ],
         },
     )
@@ -573,7 +620,7 @@ MicroduckJumpRlCfg = RslRlOnPolicyRunnerCfg(
     ),
     wandb_project="mjlab_microduck",
     experiment_name="jump",
-    run_name="run98_hip_in_stand_average",
+    run_name="run108_feet_still_all_episode",
     save_interval=25,
     num_steps_per_env=NUM_STEPS_PER_ENV,
     max_iterations=12000,

@@ -47,6 +47,9 @@ def evaluate_run90(
         use_projected_gravity=True,
         jump_duration=1.50,
     )
+    # Training observes the real head joints. Zeroing them (infer_policy's
+    # default for jump) made Run 106 fall here while it stood in mjlab.
+    policy.zero_head_obs_for_jump = "--zero-head-obs" in sys.argv
 
     # Solved static squat equilibrium:
     # Z = 0.075m, pitch = 0, flat feet
@@ -87,6 +90,15 @@ def evaluate_run90(
     trunk_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "trunk_base")
     l_foot_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "left_foot")
     r_foot_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "right_foot")
+    l_geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "left_foot_collision")
+    r_geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "right_foot_collision")
+
+    def foot_touching(geom_id):
+        for i in range(data.ncon):
+            c = data.contact[i]
+            if c.geom1 == geom_id or c.geom2 == geom_id:
+                return True
+        return False
 
     renderer = mujoco.Renderer(model, height=480, width=640)
     camera = mujoco.MjvCamera()
@@ -138,6 +150,7 @@ def evaluate_run90(
             "step": step,
             "z": trunk_pos[2],
             "x": trunk_pos[0],
+            "com_x": data.subtree_com[0][0],
             "vx": vx,
             "vz": vz,
             "roll": roll,
@@ -145,6 +158,10 @@ def evaluate_run90(
             "yaw": yaw,
             "l_foot_z": l_foot_pos[2],
             "r_foot_z": r_foot_pos[2],
+            "l_foot_x": l_foot_pos[0],
+            "r_foot_x": r_foot_pos[0],
+            "l_touch": foot_touching(l_geom_id),
+            "r_touch": foot_touching(r_geom_id),
             "min_foot_z": min_foot_z,
             "l_knee_deg": np.degrees(l_knee),
             "r_knee_deg": np.degrees(r_knee),
@@ -193,6 +210,37 @@ def evaluate_run90(
         print(f"{r['step']:4d} | {r['t']:5.2f} | {r['z']*1000:6.1f} | {r['vz']:+7.3f} | {r['pitch']:+8.2f} | {r['roll']:+8.2f} | {foot_lift:+12.1f} | {r['l_knee_deg']:+9.1f} | {r['r_knee_deg']:+9.1f}")
     print("=" * 115)
 
+    r0 = records[0]
+    print("\nPER-FOOT (lift from step 0, x from step 0, mm)")
+    print(f"{'Step':>4} | {'L_lift':>7} | {'R_lift':>7} | {'L_dx':>7} | {'R_dx':>7} | {'Trunk_dx':>8} | {'CoM_dx':>7} | {'Yaw':>6} | Touch")
+    for r in records[:31]:
+        touch = ("L" if r["l_touch"] else "-") + ("R" if r["r_touch"] else "-")
+        print(
+            f"{r['step']:4d} | {(r['l_foot_z'] - r0['l_foot_z'])*1000:+7.1f} | "
+            f"{(r['r_foot_z'] - r0['r_foot_z'])*1000:+7.1f} | "
+            f"{(r['l_foot_x'] - r0['l_foot_x'])*1000:+7.1f} | "
+            f"{(r['r_foot_x'] - r0['r_foot_x'])*1000:+7.1f} | "
+            f"{(r['x'] - r0['x'])*1000:+8.1f} | "
+            f"{(r['com_x'] - r0['com_x'])*1000:+7.1f} | {r['yaw']:+6.2f} | {touch}"
+        )
+    print(
+        f"Step-0 CoM x minus foot-mid x: "
+        f"{(r0['com_x'] - 0.5*(r0['l_foot_x'] + r0['r_foot_x']))*1000:+.1f} mm"
+    )
+    flight = [r["step"] for r in records if not r["l_touch"] and not r["r_touch"]]
+    print(f"Both feet off the floor: {len(flight)} steps {flight}")
+    lf = records[-1]
+    print(
+        f"Final L_dx {(lf['l_foot_x'] - r0['l_foot_x'])*1000:+.1f}  "
+        f"R_dx {(lf['r_foot_x'] - r0['r_foot_x'])*1000:+.1f}  "
+        f"Trunk_dx {(lf['x'] - r0['x'])*1000:+.1f} mm"
+    )
+    print(
+        f"Foot site z at rest: L {lf['l_foot_z']*1000:.1f}  R {lf['r_foot_z']*1000:.1f} mm; "
+        f"max L {max(r['l_foot_z'] for r in records)*1000:.1f}  "
+        f"R {max(r['r_foot_z'] for r in records)*1000:.1f} mm"
+    )
+
     last_r = records[-1]
     print("\nRUN 90 SQUAT-TO-JUMP CUSHION & STAND EVALUATION RESULTS")
     print("=" * 65)
@@ -207,6 +255,10 @@ def evaluate_run90(
     print(f"Max Roll Deviation       : {max_roll:.2f}° (Final: {last_r['roll']:.2f}°)")
     print(f"Final Left Knee Angle    : {last_r['l_knee_deg']:.1f}°")
     print(f"Final Right Knee Angle   : {last_r['r_knee_deg']:.1f}°")
+    step50 = records[min(50, len(records) - 1)]
+    print(f"Step 50 Hip Pitch        : L {step50['l_hip_pitch_deg']:+.1f}°  R {step50['r_hip_pitch_deg']:+.1f}°  (stand -26°/+26°)")
+    print(f"Final Hip Pitch          : L {last_r['l_hip_pitch_deg']:+.1f}°  R {last_r['r_hip_pitch_deg']:+.1f}°")
+    print(f"Final Ankle              : L {last_r['l_ankle_deg']:+.1f}°  R {last_r['r_ankle_deg']:+.1f}°  (stand +26°/−26°)")
     print("=" * 65)
 
     # Save demo GIF
@@ -218,6 +270,7 @@ def evaluate_run90(
 
 
 if __name__ == "__main__":
-    onnx_file = sys.argv[1] if len(sys.argv) > 1 else "scratch/run90_model5650.onnx"
-    out_gif = sys.argv[2] if len(sys.argv) > 2 else "docs/media/run90_squat_jump_cushion_stand.gif"
+    pos = [a for a in sys.argv[1:] if not a.startswith("--")]
+    onnx_file = pos[0] if len(pos) > 0 else "scratch/run90_model5650.onnx"
+    out_gif = pos[1] if len(pos) > 1 else "docs/media/run90_squat_jump_cushion_stand.gif"
     evaluate_run90(onnx_file, out_gif)

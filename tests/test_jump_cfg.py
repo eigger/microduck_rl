@@ -93,8 +93,9 @@ def test_actor_observation_keeps_the_61d_slot_layout():
 
 
 def test_action_rate_curriculum_stays_soft_on_run96_resume():
-    """model_17897 restores common_step_counter past 17897*24. A stage at or
-    below that counter would raise the action-rate tax before the stand exists.
+    """Run 107's model_30300 restores common_step_counter past 30300*24. A
+    2500-iter resume reaches iter 32800. A stage at or below that would raise the
+    action-rate tax while the stand is still short of 118.5 mm.
     """
     cfg = make_microduck_jump_env_cfg()
     stages = cfg.curriculum["action_rate_weight"].params["weight_stages"]
@@ -102,7 +103,8 @@ def test_action_rate_curriculum_stays_soft_on_run96_resume():
     assert stages[0]["weight"] == -0.05
     later = [s["step"] for s in stages if s["weight"] < -0.05]
     assert later
-    assert min(later) > 17897 * 24
+    assert min(later) > 32800 * 24
+    assert cfg.events["reset_stand_curriculum"].params["fraction"] == 0.25
 
 
 def test_rise_starts_before_the_measured_fall():
@@ -119,6 +121,30 @@ def test_rise_starts_before_the_measured_fall():
     held = 0.5 * ((0.618 ** 2) + (0.524 ** 2))
     assert rise["std_stand_knee"] >= 0.55
     assert math.exp(-held / (rise["std_stand_knee"] ** 2)) > 0.30
+
+
+def test_jump_pays_body_flight_and_plants_feet():
+    """Run 101 flew 0.12 s with the feet 15 mm up and landed them +12/+18 mm
+    ahead. Takeoff at weight 30 paid ~2.2 per episode against ~18.5 for the
+    stand, so lifting the body was not worth the landing risk.
+    """
+    cfg = make_microduck_jump_env_cfg()
+    r = cfg.rewards
+    assert r["jump_takeoff_vz"].weight >= 60.0
+    # Run 104 at -30 paid ~1.3 per episode, less than its takeoff gain.
+    assert r["jump_foot_landing_offset"].weight <= -90.0
+    # Run 103 dragged the feet 20 mm back during the push (steps 4-8).
+    assert r["jump_foot_landing_offset"].params["min_step"] <= 4
+    # Run 103 read < 1 N at 0 mm foot height and paid the extension as flight.
+    for name in ("jump_takeoff_vz", "jump_peak_height"):
+        assert r[name].params["min_foot_lift"] >= 0.003
+    assert r["jump_foot_clearance"].params["ground_offset"] == 0.0
+    assert r["jump_yaw_drift"].weight < 0
+    assert r["jump_foot_slip"].weight < 0
+    # Run 107 stepped one foot after landing; rebound_hop needs both feet up.
+    assert r["jump_foot_slip"].params["max_step"] >= 75
+    for name in ("jump_sagittal_drift", "jump_lateral_drift"):
+        assert r[name].weight < 0
 
 
 def test_obs_parity_with_roulade():
