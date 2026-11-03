@@ -10,7 +10,8 @@
     # A gait for a slot (no hold, no unwind: it runs until told otherwise)
     uv run publish --onnx walk.onnx --repo <user>/microduck-my-walk --kind perpetual --slot walk
 
-Either way the repo gets `policy.onnx`, a schema-2 `manifest.json` and a README, the file is
+Either way the repo gets `policy.onnx`, a schema-2 `manifest.json` and a README (plus `replay.mp4`
+when given `--video`, which the Hub's replay widget shows), the file is
 checked for the 61 -> 14 shape and smoke-run before anything is uploaded, and an existing
 `policy.onnx` is not overwritten without `--force`. `--dry-run` writes the repo contents to a
 local directory and stops.
@@ -49,6 +50,12 @@ class PublishConfig:
     """A local model_<N>.pt instead of wandb."""
     onnx: str | None = None
     """An already-exported ONNX. Validated, not re-exported."""
+    video: str | None = None
+    """An MP4 of the policy running (e.g. from scripts/render_policy.py). Uploaded as replay.mp4."""
+
+    base_model: str | None = None
+    """Remix: the Hub repo of the policy this one was trained from (warm start / fine-tune).
+    Declared as `base_model` in the model card so the Hub links the two."""
 
     # -- what the manifest says
     name: str | None = None
@@ -71,6 +78,16 @@ class PublishConfig:
     """The pose the policy expects to start from."""
     twist_help: str | None = None
     """Prose for `command.twist` when the slots mean something (flamingo: '[flag, side, 0]')."""
+
+    # -- training checkpoint (opt-in)
+    share_training: bool = False
+    """Also share the training checkpoint (+ its distillation teachers) as a bundle in a SEPARATE repo
+    (`share-training`, docs/training_checkpoints.md); the manifest's `training.bundle` points to it.
+    Needs a checkpoint source (--wandb-run-path or --checkpoint-file), not --onnx."""
+    training_repo: str | None = None
+    """Bundle repo. Default: `<owner of --repo>/microduck-training`."""
+    training_public: bool = False
+    """Create the bundle repo public (existing repos keep their visibility)."""
 
     # -- how
     private: bool = True
@@ -135,6 +152,27 @@ def _resolve_weights(cfg: PublishConfig, workdir: Path) -> tuple[Path, dict]:
     return result.onnx_path, training
 
 
+def _share_training(cfg: PublishConfig, onnx_path: Path, training: dict) -> str:
+    """Bundle the checkpoint this ONNX came from; returns its hf:// spec for the manifest."""
+    from mjlab_microduck.publish.training import DEFAULT_REPO_NAME, ShareConfig, share
+
+    if cfg.onnx is not None:
+        _fail("--share-training needs the checkpoint: publish with --task + --wandb-run-path/--checkpoint-file, not --onnx")
+    owner = cfg.repo.split("/", 1)[0]
+    return share(
+        ShareConfig(
+            wandb_run_path=cfg.wandb_run_path if cfg.checkpoint_file is None else None,
+            checkpoint=training.get("checkpoint"),
+            checkpoint_file=cfg.checkpoint_file,
+            task=cfg.task,
+            repo=cfg.training_repo or f"{owner}/{DEFAULT_REPO_NAME}",
+            public=cfg.training_public,
+            dry_run=cfg.dry_run,
+        ),
+        onnx_files=[(onnx_path, {"repo": cfg.repo, "file": m.POLICY_FILE})],
+    )
+
+
 def _default_name(repo: str) -> str:
     stem = repo.rsplit("/", 1)[-1]
     return stem.removeprefix("microduck-").removeprefix("microduck_") or stem
@@ -144,6 +182,9 @@ def run(cfg: PublishConfig) -> int:
     if "/" not in cfg.repo:
         _fail("--repo must be `<user-or-org>/<name>`")
     name = cfg.name or _default_name(cfg.repo)
+    video = Path(cfg.video) if cfg.video is not None else None
+    if video is not None and (not video.is_file() or video.suffix.lower() != ".mp4"):
+        _fail(f"--video {cfg.video}: expected an existing .mp4 file")
 
     workdir = Path(tempfile.mkdtemp(prefix="microduck-publish-"))
     try:
@@ -153,6 +194,9 @@ def run(cfg: PublishConfig) -> int:
         if cfg.smoke:
             m.smoke_run_onnx(onnx_path)
             print("[publish] smoke run: finite, non-constant output")
+
+        if cfg.share_training:
+            training["bundle"] = _share_training(cfg, onnx_path, training)
 
         command_help = {"twist": cfg.twist_help} if cfg.twist_help else None
         manifest = m.build_manifest(
@@ -175,19 +219,23 @@ def run(cfg: PublishConfig) -> int:
         staged.mkdir()
         shutil.copyfile(onnx_path, staged / m.POLICY_FILE)
         (staged / "manifest.json").write_text(m.dump_manifest(manifest))
-        (staged / "README.md").write_text(m.render_readme(manifest, cfg.repo))
+        (staged / "README.md").write_text(m.render_readme(manifest, cfg.repo, cfg.base_model))
+        if video is not None:
+            shutil.copyfile(video, staged / m.REPLAY_FILE)
 
         if cfg.dry_run:
             dest = Path.cwd() / f"publish-{name}"
             if dest.exists():
                 shutil.rmtree(dest)
             shutil.copytree(staged, dest)
-            print(f"[publish] dry run: wrote {dest}/ (policy.onnx, manifest.json, README.md)")
+            print(f"[publish] dry run: wrote {dest}/ ({', '.join(sorted(p.name for p in dest.iterdir()))})")
             return 0
 
         from huggingface_hub import HfApi
 
         api = HfApi()
+        if cfg.base_model is not None and not api.repo_exists(cfg.base_model, repo_type="model"):
+            _fail(f"--base-model {cfg.base_model}: no such model repo on the Hub (or no access)")
         api.create_repo(cfg.repo, repo_type="model", private=cfg.private, exist_ok=True)
         existing = set(api.list_repo_files(cfg.repo))
         onnx_files = {f for f in existing if f.endswith(".onnx")}
