@@ -26,8 +26,9 @@ def test_jump_rewards_present_and_signs():
     # Positive jump rewards (Run 92 Squat → Launch → Flight Clearance → Cushion → Stand)
     assert "squat_to_jump_pose" in r and r["squat_to_jump_pose"].weight > 0
     assert "jump_takeoff_vz" in r and r["jump_takeoff_vz"].weight > 0
-    assert "jump_foot_clearance" in r and r["jump_foot_clearance"].weight > 0
-    assert "jump_peak_height" in r and r["jump_peak_height"].weight > 0
+    assert "jump_flight_height" in r and r["jump_flight_height"].weight > 0
+    assert "jump_foot_clearance" not in r
+    assert "jump_peak_height" not in r
     assert "jump_landing_cushion" in r and r["jump_landing_cushion"].weight > 0
     assert "jump_landing_rise" in r and r["jump_landing_rise"].weight > 0
     assert "upright" in r and r["upright"].weight > 0
@@ -92,10 +93,9 @@ def test_actor_observation_keeps_the_61d_slot_layout():
     assert "base_lin_vel" in critic_terms
 
 
-def test_action_rate_curriculum_stays_soft_on_run96_resume():
-    """Run 107's model_30300 restores common_step_counter past 30300*24. A
-    2500-iter resume reaches iter 32800. A stage at or below that would raise the
-    action-rate tax while the stand is still short of 118.5 mm.
+def test_action_rate_curriculum_stays_soft_on_run110_resume():
+    """Run 110 resumes model_33450 for 1000 landing-refinement iterations.
+    Smoothness must stay soft while the new height is being preserved.
     """
     cfg = make_microduck_jump_env_cfg()
     stages = cfg.curriculum["action_rate_weight"].params["weight_stages"]
@@ -103,7 +103,7 @@ def test_action_rate_curriculum_stays_soft_on_run96_resume():
     assert stages[0]["weight"] == -0.05
     later = [s["step"] for s in stages if s["weight"] < -0.05]
     assert later
-    assert min(later) > 32800 * 24
+    assert min(later) > 34450 * 24
     assert cfg.events["reset_stand_curriculum"].params["fraction"] == 0.25
 
 
@@ -123,7 +123,7 @@ def test_rise_starts_before_the_measured_fall():
     assert math.exp(-held / (rise["std_stand_knee"] ** 2)) > 0.30
 
 
-def test_jump_pays_body_flight_and_plants_feet():
+def test_jump_pays_true_body_flight_and_plants_feet():
     """Run 101 flew 0.12 s with the feet 15 mm up and landed them +12/+18 mm
     ahead. Takeoff at weight 30 paid ~2.2 per episode against ~18.5 for the
     stand, so lifting the body was not worth the landing risk.
@@ -131,18 +131,29 @@ def test_jump_pays_body_flight_and_plants_feet():
     cfg = make_microduck_jump_env_cfg()
     r = cfg.rewards
     assert r["jump_takeoff_vz"].weight >= 60.0
-    # Run 104 at -30 paid ~1.3 per episode, less than its takeoff gain.
+    # Independent clearance and peak terms let foot tuck and squat extension
+    # earn separately. The composite must require both.
+    assert r["jump_flight_height"].weight >= 100.0
+    assert r["jump_flight_height"].params["target_z"] > r["jump_flight_height"].params["stand_z"]
+    assert r["jump_flight_height"].params["target_foot_lift"] >= 0.035
+    # Stage 2 tightens placement only after Run 109 discovered more height.
     assert r["jump_foot_landing_offset"].weight <= -90.0
-    # Run 103 dragged the feet 20 mm back during the push (steps 4-8).
-    assert r["jump_foot_landing_offset"].params["min_step"] <= 4
+    assert r["jump_foot_landing_offset"].params["min_step"] >= 14
     # Run 103 read < 1 N at 0 mm foot height and paid the extension as flight.
-    for name in ("jump_takeoff_vz", "jump_peak_height"):
+    for name in ("jump_takeoff_vz", "jump_flight_height"):
         assert r[name].params["min_foot_lift"] >= 0.003
-    assert r["jump_foot_clearance"].params["ground_offset"] == 0.0
-    assert r["jump_yaw_drift"].weight < 0
+    # Run 111/112 proved stronger single-axis penalties only move the exploit
+    # into another axis; preserve the measured Run 110 balance.
+    assert r["jump_yaw_drift"].weight == -20.0
     assert r["jump_foot_slip"].weight < 0
-    # Run 107 stepped one foot after landing; rebound_hop needs both feet up.
+    # Run 108 incorrectly used 1 m and taxed normal airborne foot motion.
+    assert r["jump_foot_slip"].params["max_height"] <= 0.004
+    # The whole window still catches Run 107's post-landing step.
     assert r["jump_foot_slip"].params["max_step"] >= 75
+    assert r["jump_sagittal_drift"].weight == -4.0
+    # Weight 15 produced a 19.4-point jackpot; Run 109's weight 2 lost stand
+    # height, while a 64-env pilot at 5 collapsed jump height in four updates.
+    assert 2.0 < r["jump_landing_rise"].weight <= 3.0
     for name in ("jump_sagittal_drift", "jump_lateral_drift"):
         assert r[name].weight < 0
 
@@ -167,7 +178,7 @@ if __name__ == "__main__":
     test_jump_sensors_and_terminations()
     test_jump_play_variant()
     test_actor_observation_keeps_the_61d_slot_layout()
-    test_action_rate_curriculum_stays_soft_on_run96_resume()
+    test_action_rate_curriculum_stays_soft_on_run110_resume()
     test_rise_starts_before_the_measured_fall()
     test_obs_parity_with_roulade()
     print("ALL JUMP CFG TESTS PASSED!")

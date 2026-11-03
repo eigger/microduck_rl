@@ -8571,6 +8571,108 @@ def jump_takeoff_vz_reward(
     return torch.nan_to_num(reward, nan=0.0)
 
 
+def flight_height_score(
+    trunk_z: torch.Tensor,
+    min_foot_z: torch.Tensor,
+    floor_z: torch.Tensor,
+    stand_z: float,
+    target_z: float,
+    min_foot_lift: float,
+    target_foot_lift: float,
+) -> torch.Tensor:
+    """Multiplicative body-rise and bilateral-foot-clearance score.
+
+    Either factor alone is cheat-able: extending from the squat raises the
+    trunk without a jump, while tucking the legs raises the feet without
+    lifting the body. Their product only pays when both improve together.
+    """
+    body = torch.clamp(
+        (trunk_z - stand_z) / max(1e-4, target_z - stand_z),
+        min=0.0,
+        max=1.25,
+    )
+    foot_lift = min_foot_z - floor_z
+    feet = torch.clamp(
+        (foot_lift - min_foot_lift)
+        / max(1e-4, target_foot_lift - min_foot_lift),
+        min=0.0,
+        max=1.25,
+    )
+    return body * feet
+
+
+def jump_flight_height_reward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    stand_z: float = 0.118,
+    target_z: float = 0.155,
+    min_foot_lift: float = 0.004,
+    target_foot_lift: float = 0.035,
+    min_step: int = 6,
+    max_step: int = 20,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Pay a high, upright, true bilateral flight instead of foot tucking.
+
+    The finite launch window prevents a goal-state jackpot. Contact and the
+    physical foot-height gate both have to agree that the robot is airborne.
+    """
+    step_count = env.episode_length_buf
+    active = ((step_count >= min_step) & (step_count <= max_step)).float()
+    asset: Entity = env.scene[asset_cfg.name]
+
+    from mjlab.sensor import ContactSensor
+    sensor: ContactSensor = env.scene[sensor_name]
+    feet_force_mag = torch.norm(
+        torch.nan_to_num(sensor.data.force, nan=0.0), dim=-1
+    )
+    both_airborne = ~torch.any(feet_force_mag > 1.0, dim=-1)
+
+    if not hasattr(env, "_foot_site_ids"):
+        env._foot_site_ids = [
+            asset.site_names.index("left_foot"),
+            asset.site_names.index("right_foot"),
+        ]
+    min_foot_z = torch.min(
+        asset.data.site_pos_w[:, env._foot_site_ids, 2], dim=-1
+    ).values
+    floor_z = env.scene.terrain.env_origins[:, 2]
+    trunk_z = asset.data.root_link_pos_w[:, 2] - floor_z
+    min_foot_lift_now = min_foot_z - floor_z
+    fresh = env.episode_length_buf <= 1
+    for name, value in (
+        ("_jump_max_trunk_rel_z", trunk_z),
+        ("_jump_max_min_foot_lift", min_foot_lift_now),
+    ):
+        previous = getattr(env, name, None)
+        if previous is None or previous.shape != value.shape:
+            previous = value.detach().clone()
+        previous = torch.where(fresh, value.detach(), torch.maximum(previous, value))
+        setattr(env, name, previous)
+    env.extras["log"]["Metrics/jump_peak_z_mm"] = (
+        env._jump_max_trunk_rel_z.mean() * 1000.0
+    )
+    env.extras["log"]["Metrics/min_foot_peak_mm"] = (
+        env._jump_max_min_foot_lift.mean() * 1000.0
+    )
+    score = flight_height_score(
+        trunk_z,
+        min_foot_z,
+        floor_z,
+        stand_z,
+        target_z,
+        min_foot_lift,
+        target_foot_lift,
+    )
+
+    quat = asset.data.root_link_quat_w
+    cos_tilt = 1.0 - 2.0 * (quat[:, 1] ** 2 + quat[:, 2] ** 2)
+    upright = torch.clamp(cos_tilt, min=0.0, max=1.0)
+    lifted = _jump_feet_lifted(env, asset, min_foot_lift)
+    reward = active * both_airborne.float() * lifted.float() * upright * score
+    return torch.nan_to_num(reward, nan=0.0)
+
+
 def jump_peak_height_reward(
     env: ManagerBasedRlEnv,
     sensor_name: str = "feet_ground_contact",

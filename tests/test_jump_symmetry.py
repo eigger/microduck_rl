@@ -12,6 +12,7 @@ import math
 import torch
 
 from mjlab_microduck.tasks.mdp import (
+    flight_height_score,
     foot_gap_potential_delta,
     foot_load_balance,
     feet_above_floor,
@@ -24,6 +25,24 @@ from mjlab_microduck.tasks.mdp import (
     symmetric_hip_pitch_score,
     symmetric_knee_flexion_score,
 )
+
+
+def test_true_flight_height_requires_body_and_feet_together():
+    """Neither standing extension nor a feet-only tuck may earn flight."""
+    floor = torch.zeros(4)
+    score = flight_height_score(
+        trunk_z=torch.tensor([0.118, 0.141, 0.141, 0.155]),
+        min_foot_z=torch.tensor([0.035, 0.004, 0.009, 0.035]),
+        floor_z=floor,
+        stand_z=0.118,
+        target_z=0.155,
+        min_foot_lift=0.004,
+        target_foot_lift=0.035,
+    )
+    assert float(score[0]) == 0.0  # feet up, body not above stand
+    assert float(score[1]) == 0.0  # body up, feet below the flight gate
+    assert 0.05 < float(score[2]) < 0.20  # Run 108 remains on-gradient
+    assert torch.isclose(score[3], torch.tensor(1.0))
 
 
 def test_knee_and_ankle_symmetry_in_jump_landing_rise():

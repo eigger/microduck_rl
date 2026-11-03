@@ -57,6 +57,8 @@ def main():
     fell = torch.zeros(n, dtype=torch.bool, device=device)
     max_tilt = torch.zeros(n, device=device)
     max_z = torch.zeros(n, device=device)
+    foot_site_ids = [robot.site_names.index("left_foot"), robot.site_names.index("right_foot")]
+    max_min_foot_z = torch.full((n,), -torch.inf, device=device)
     final = {}
     steps = int(round(cfg.episode_length_s / (cfg.sim.mujoco.timestep * cfg.decimation)))
     for t in range(steps):
@@ -66,8 +68,13 @@ def main():
         cos_tilt = 1.0 - 2.0 * (q[:, 1] ** 2 + q[:, 2] ** 2)
         tilt = torch.rad2deg(torch.acos(cos_tilt.clamp(-1, 1)))
         z = robot.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2]
+        feet_z = robot.data.site_pos_w[:, foot_site_ids, 2] - env.scene.terrain.env_origins[:, 2:3]
+        min_foot_z = feet_z.min(dim=-1).values
         max_tilt = torch.where(alive, torch.maximum(max_tilt, tilt), max_tilt)
         max_z = torch.where(alive, torch.maximum(max_z, z), max_z)
+        max_min_foot_z = torch.where(
+            alive, torch.maximum(max_min_foot_z, min_foot_z), max_min_foot_z
+        )
         fell |= alive & term
         if t == steps - 2:
             fwd, left = microduck_mdp.spawn_frame_offset(
@@ -91,6 +98,7 @@ def main():
         print(f"\n[{label}] n={k}  fell={int((mask & fell).sum())} ({100*float((mask & fell).sum())/k:.1f}%)")
         print(f"  max tilt  median {float(max_tilt[mask].median()):.1f}°  p90 {float(max_tilt[mask].quantile(0.9)):.1f}°")
         print(f"  max z     median {float(max_z[mask].median())*1000:.1f} mm")
+        print(f"  min-foot peak median {float(max_min_foot_z[mask].median())*1000:.1f} mm")
         if int(ok.sum()):
             for key, v in final.items():
                 x = v[ok]
