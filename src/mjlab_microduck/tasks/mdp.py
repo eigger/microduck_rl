@@ -135,8 +135,8 @@ try:
             self.env.unwrapped.common_step_counter = 0
             self.current_learning_iteration = 0
             print(
-                f"[mdp] Patch 5: WARM START from {path} — common_step_counter "
-                f"{restored} → 0, iteration → 0 (curricula restart; weights/normalizer/optimizer kept)"
+                f"[mdp] Patch 5: WARM START from {path} -- common_step_counter "
+                f"{restored} -> 0, iteration -> 0 (curricula restart; weights/normalizer/optimizer kept)"
             )
         return infos
 
