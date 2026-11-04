@@ -1669,7 +1669,10 @@ def feet_tiptoe_alignment(
     feet_flat_penalty is NOT used in this task; the two would fight.
     """
     asset: Entity = env.scene[asset_cfg.name]
-    quats = asset.data.site_quat_w[:, asset_cfg.site_ids, :]  # (B, N, 4) [w, x, y, z]
+    site_ids = asset_cfg.site_ids
+    if site_ids == slice(None) or isinstance(site_ids, slice) or (isinstance(site_ids, (list, tuple)) and len(site_ids) != 2):
+        site_ids, _ = asset.find_sites("^(left_foot|right_foot)$")
+    quats = asset.data.site_quat_w[:, site_ids, :]  # (B, 2, 4) [w, x, y, z]
     w, qx, qy, qz = quats[:, :, 0], quats[:, :, 1], quats[:, :, 2], quats[:, :, 3]
     x_axis_z = 2.0 * (qx * qz - w * qy)  # (B, N) — z-component of local x-axis in world
     alignment = (-x_axis_z).sum(dim=-1)  # +1 per foot when pointing straight down

@@ -15,6 +15,7 @@ from copy import deepcopy
 
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.managers import RewardTermCfg
+from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.rl import RslRlOnPolicyRunnerCfg
 
 import mjlab_microduck.tasks.mdp as microduck_mdp
@@ -85,6 +86,7 @@ def make_microduck_ballet_env_cfg(
         func=microduck_mdp.ballet_flat_foot_contact_penalty,
         weight=-2.5,
         params={
+            "asset_cfg": SceneEntityCfg("robot", site_names=("left_foot", "right_foot")),
             "min_tiptoe_alignment": 0.50,
         },
     )
