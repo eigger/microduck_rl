@@ -9725,4 +9725,147 @@ def jump_anti_tiptoe_penalty(
     cost = ankle_asym * 2.0 + (l_tiptoe + r_tiptoe) * 3.0
     return torch.nan_to_num(cost, nan=0.0)
 
+# ==============================================================================
+# Ballet Tiptoe Task (Demipointe / Pointe gait)
+# ==============================================================================
+
+def ballet_ankle_tiptoe_reward(
+    env: ManagerBasedRlEnv,
+    target_plantar_deg: float = 38.0,
+    std_rad: float = 0.15,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Reward maintaining a graceful tiptoe (plantar-flexed) ankle posture.
+
+    Left ankle extends positively (+target), right ankle extends negatively (-target).
+    Returns [0, 1]; use with positive weight.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    joint_pos = _servo_joint_pos(env, asset)
+
+    target_rad = math.radians(target_plantar_deg)
+    l_err = joint_pos[:, 4] - target_rad
+    r_err = joint_pos[:, 13] + target_rad
+
+    sq_err = torch.square(l_err) + torch.square(r_err)
+    reward = torch.exp(-sq_err / (2.0 * std_rad * std_rad))
+    return torch.nan_to_num(reward, nan=0.0)
+
+
+def ballet_ankle_asymmetry_penalty(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Penalize asymmetry between left and right ankles during tiptoe walking.
+
+    Returns >= 0; use with negative weight.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    joint_pos = _servo_joint_pos(env, asset)
+
+    # In microduck, left + right = 0 when symmetrical
+    asym = torch.abs(joint_pos[:, 4] + joint_pos[:, 13])
+    return torch.nan_to_num(asym, nan=0.0)
+
+
+def ballet_straight_knees_reward(
+    env: ManagerBasedRlEnv,
+    std_rad: float = 0.20,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    min_ankle_deg: float = 26.0,
+    target_ankle_deg: float = 55.0,
+) -> torch.Tensor:
+    """Reward keeping knees extended straight (ballet elegance, not crouching).
+
+    Gated by ankle plantar-flexion: 0 reward at nominal flat foot (<=26 deg),
+    linearly ramping to 1.0 at >=55 deg. Forces tiptoe before awarding knee extension.
+    Returns [0, 1]; use with positive weight.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    joint_pos = _servo_joint_pos(env, asset)
+
+    l_knee = joint_pos[:, 3]
+    r_knee = joint_pos[:, 12]
+    sq_err = torch.square(l_knee) + torch.square(r_knee)
+    reward = torch.exp(-sq_err / (2.0 * std_rad * std_rad))
+
+    # Tiptoe gate
+    l_ankle = joint_pos[:, 4]
+    r_ankle = -joint_pos[:, 13]
+    mean_ankle_deg = torch.rad2deg(0.5 * (l_ankle + r_ankle))
+    gate = torch.clamp((mean_ankle_deg - min_ankle_deg) / (target_ankle_deg - min_ankle_deg), min=0.0, max=1.0)
+    return torch.nan_to_num(reward * gate, nan=0.0)
+
+
+def ballet_tall_trunk_height_reward(
+    env: ManagerBasedRlEnv,
+    target_height: float = 0.125,
+    std_m: float = 0.015,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    min_ankle_deg: float = 26.0,
+    target_ankle_deg: float = 55.0,
+) -> torch.Tensor:
+    """Reward maintaining an elevated trunk height enabled by tiptoe standing/walking.
+
+    Gated by ankle plantar-flexion: zero reward at nominal flat foot (<=26 deg),
+    linearly ramping to 1.0 at >=55 deg. Prevents flat-foot cheating.
+    Returns [0, 1]; use with positive weight.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    trunk_z = asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2]
+
+    err = trunk_z - target_height
+    reward = torch.exp(-torch.square(err) / (2.0 * std_m * std_m))
+
+    # Tiptoe gate
+    joint_pos = _servo_joint_pos(env, asset)
+    l_ankle = joint_pos[:, 4]
+    r_ankle = -joint_pos[:, 13]
+    mean_ankle_deg = torch.rad2deg(0.5 * (l_ankle + r_ankle))
+    gate = torch.clamp((mean_ankle_deg - min_ankle_deg) / (target_ankle_deg - min_ankle_deg), min=0.0, max=1.0)
+    return torch.nan_to_num(reward * gate, nan=0.0)
+
+
+def ballet_flat_foot_contact_penalty(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", site_names=("left_foot", "right_foot")),
+    min_tiptoe_alignment: float = 0.50,
+) -> torch.Tensor:
+    """Penalize flat foot ground contacts during walking (forces tiptoe en-pointe steps).
+
+    The foot site local x-axis points downward when on tiptoes (-x_axis_z > 0.50).
+    When flat: -x_axis_z <= 0.0.
+    Gated by ground contact: only stance feet in contact with ground are penalized if flat.
+    Returns >= 0; use with negative weight.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    quats = asset.data.site_quat_w[:, asset_cfg.site_ids, :]  # (B, N, 4)
+    w, qx, qy, qz = quats[:, :, 0], quats[:, :, 1], quats[:, :, 2], quats[:, :, 3]
+    x_axis_z = 2.0 * (qx * qz - w * qy)
+    tiptoe_alignment = -x_axis_z
+
+    violation = torch.clamp(min_tiptoe_alignment - tiptoe_alignment, min=0.0)
+
+    from mjlab.sensor import ContactSensor
+    sensor: ContactSensor = env.scene[sensor_name]
+    contact_time = sensor.data.current_contact_time
+    if contact_time is not None:
+        violation = violation * (contact_time > 0.0).float()
+
+    return torch.nan_to_num(violation.sum(dim=-1), nan=0.0)
+
+
+def ballet_graceful_torso_penalty(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Penalize torso tilt (pitch and roll) for upright posture during ballet walk.
+
+    Returns >= 0; use with negative weight.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    proj_g = asset.data.projected_gravity_b
+    tilt_sq = torch.square(proj_g[:, 0]) + torch.square(proj_g[:, 1])
+    return torch.nan_to_num(tilt_sq, nan=0.0)
 

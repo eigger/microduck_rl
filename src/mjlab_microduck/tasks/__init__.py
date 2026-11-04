@@ -94,7 +94,20 @@ from .microduck_squat_env_cfg import (
     make_microduck_squat_env_cfg,
     MicroduckSquatRlCfg,
 )
+from .microduck_ballet_env_cfg import (
+    make_microduck_ballet_env_cfg,
+    MicroduckBalletRlCfg,
+)
 from .backlash import make_backlash_variant
+
+# Ballet task — graceful tiptoe walking gait (demipointe / pointe)
+register_mjlab_task(
+    task_id="Mjlab-Ballet-Flat-MicroDuck",
+    env_cfg=make_microduck_ballet_env_cfg(),
+    play_env_cfg=make_microduck_ballet_env_cfg(play=True),
+    rl_cfg=MicroduckBalletRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
 
 # Jump task — crouch, explosive upward launch, both feet airborne, landing rest
 register_mjlab_task(
@@ -309,6 +322,7 @@ _BACKLASH_TASKS = (
     ("Mjlab-SitStand-Rough-Backlash-MicroDuck", make_microduck_sitstand_env_cfg, {"rough": True}, MicroduckSitStandRlCfg, _BL_GROUNDCONTACT),
     ("Mjlab-Squat-Flat-Backlash-MicroDuck", make_microduck_squat_env_cfg, {}, MicroduckSquatRlCfg, _BL_GROUNDCONTACT),
     ("Mjlab-Squat-Rough-Backlash-MicroDuck", make_microduck_squat_env_cfg, {"rough": True}, MicroduckSquatRlCfg, _BL_GROUNDCONTACT),
+    ("Mjlab-Ballet-Flat-Backlash-MicroDuck", make_microduck_ballet_env_cfg, {}, MicroduckBalletRlCfg, _BL_WALK),
     ("Mjlab-GroundPick-Flat-Backlash-MicroDuck", make_microduck_ground_pick_env_cfg, {}, MicroduckGroundPickRlCfg, _BL_GROUNDCONTACT),
     ("Mjlab-GroundPick-Rough-Backlash-MicroDuck", make_microduck_ground_pick_env_cfg, {"rough": True}, MicroduckGroundPickRlCfg, _BL_GROUNDCONTACT),
     ("Mjlab-BallKick-Flat-Backlash-MicroDuck", make_microduck_ball_kick_env_cfg, {}, MicroduckBallKickRlCfg, _BL_GROUNDCONTACT),

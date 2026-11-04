@@ -41,7 +41,7 @@ def _invoked_as_train() -> bool:
     parser reject the flag instead.
     """
     prog = Path(sys.argv[0]).name
-    return prog.removesuffix(".py").removesuffix("-script") == "train"
+    return prog.removesuffix(".exe").removesuffix(".py").removesuffix("-script") == "train"
 
 
 def maybe_init_checkpoint() -> None:
