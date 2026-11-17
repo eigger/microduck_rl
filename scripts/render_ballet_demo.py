@@ -49,6 +49,9 @@ def render_ballet_walk(
         walking_onnx_path=onnx_path,
         standing_onnx_path=None,
         jump_onnx_path=None,
+        # Match training BAM actuator latency (delay_min_lag=3..6 substeps = 15..30 ms ≈ 1 step at 50 Hz)
+        delay_min_lag=1,
+        delay_max_lag=1,
         new_cmd_obs=True,
         use_projected_gravity=True,
     )
@@ -94,12 +97,12 @@ def render_ballet_walk(
 
         # Choreography:
         # 0.0s ~ 1.0s: Elegant tiptoe standing on place
-        # 1.0s ~ 3.5s: Forward tiptoe walk (Vx = 0.14 m/s)
+        # 1.0s ~ 3.5s: Forward tiptoe walk (Vx = 0.12 m/s)
         # 3.5s ~ 5.0s: Graceful pirouette / curve turn (Vx = 0.06 m/s, Vyaw = 0.6 rad/s)
         if t < 1.0:
             policy.vel_cmd = np.array([0.0, 0.0, 0.0], dtype=np.float32)
         elif t < 3.5:
-            policy.vel_cmd = np.array([0.14, 0.0, 0.0], dtype=np.float32)
+            policy.vel_cmd = np.array([0.12, 0.0, 0.0], dtype=np.float32)
         else:
             policy.vel_cmd = np.array([0.06, 0.0, 0.6], dtype=np.float32)
         policy._update_command()
@@ -163,7 +166,7 @@ def render_ballet_walk(
 
 
 if __name__ == "__main__":
-    default_onnx = "logs/rsl_rl/ballet/2026-11-04_15-44-07_run02_ballet_steep_tiptoe/2026-11-04_15-44-07_run02_ballet_steep_tiptoe.onnx"
+    default_onnx = "policies/ballet.onnx"
     default_gif = "docs/media/ballet_tiptoe_walk.gif"
 
     onnx = sys.argv[1] if len(sys.argv) > 1 else default_onnx

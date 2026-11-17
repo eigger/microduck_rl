@@ -9732,34 +9732,110 @@ def jump_anti_tiptoe_penalty(
 # Ballet Tiptoe Task (Demipointe / Pointe gait)
 # ==============================================================================
 
+
+def _ballet_stance_knee_sq(
+    env: ManagerBasedRlEnv,
+    asset: Entity,
+    sensor_name: str = "feet_ground_contact",
+    command_name: str = "twist",
+    command_threshold: float = 0.01,
+) -> torch.Tensor:
+    """Compute squared knee flexion error for grounded stance feet (or both legs when standing).
+
+    During walking (cmd >= threshold), only grounded feet must keep a straight knee,
+    and at least one knee must remain straight (minimum of the two), so double-knee
+    or single-leg flat-foot crouching is still blocked while an airborne swing leg can
+    bend naturally (~20-35 deg passé lift) to clear the floor on 68-deg tiptoes.
+    During standing (cmd < threshold), both knees must be straight.
+    """
+    joint_pos = _servo_joint_pos(env, asset)
+    l_k2 = torch.square(joint_pos[:, 3])
+    r_k2 = torch.square(joint_pos[:, 12])
+    both_k2 = l_k2 + r_k2
+
+    sensor = getattr(env.scene, "sensors", {}).get(sensor_name)
+    if sensor is None:
+        return both_k2
+    contact_time = getattr(sensor.data, "current_contact_time", None)
+    if contact_time is None:
+        return both_k2
+
+    in_contact = (contact_time > 0.0).float()
+    contact_k2 = in_contact[:, 0] * l_k2 + in_contact[:, 1] * r_k2
+    min_k2 = torch.minimum(l_k2, r_k2)
+    walk_k2 = torch.maximum(contact_k2, min_k2)
+
+    cmd = env.command_manager.get_command(command_name)
+    if cmd is None:
+        return both_k2
+    speed = torch.norm(cmd[:, :2], dim=-1) + torch.abs(cmd[:, 2])
+    standing = speed < command_threshold
+    return torch.where(standing, both_k2, walk_k2)
+
+
 def ballet_ankle_tiptoe_reward(
     env: ManagerBasedRlEnv,
-    target_plantar_deg: float = 38.0,
-    std_rad: float = 0.15,
+    target_plantar_deg: float = 66.0,
+    swing_plantar_deg: float = 68.0,
+    stance_plantar_deg: float = 64.0,
+    std_rad: float = 0.28,
+    knee_std_rad: float = 0.30,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    sensor_name: str = "feet_ground_contact",
+    command_name: str = "twist",
+    command_threshold: float = 0.01,
 ) -> torch.Tensor:
-    """Reward maintaining a graceful tiptoe (plantar-flexed) ankle posture.
+    """Reward phase-aware tiptoe ankle posture (stance demipointe + swing full-pointe).
 
-    Left ankle extends positively (+target), right ankle extends negatively (-target).
+    When standing (cmd < threshold): both ankles target ``target_plantar_deg`` (66 deg).
+    When walking: the grounded stance foot targets ``stance_plantar_deg`` (64 deg), and as
+    a swinging foot leaves the floor (``current_air_time`` ramping 0 -> 0.10 s) the target
+    smoothly advances to ``swing_plantar_deg`` (68 deg) without a liftoff cliff.
+    Gated on stance knee extension so flat-foot crouching earns ~0.
     Returns [0, 1]; use with positive weight.
     """
     asset: Entity = env.scene[asset_cfg.name]
     joint_pos = _servo_joint_pos(env, asset)
 
-    target_rad = math.radians(target_plantar_deg)
-    l_err = joint_pos[:, 4] - target_rad
-    r_err = joint_pos[:, 13] + target_rad
+    sensor = getattr(env.scene, "sensors", {}).get(sensor_name)
+    contact_time = getattr(sensor.data, "current_contact_time", None) if sensor is not None else None
+    cmd = env.command_manager.get_command(command_name)
+
+    if contact_time is not None and cmd is not None:
+        speed = torch.norm(cmd[:, :2], dim=-1) + torch.abs(cmd[:, 2])
+        walking = (speed >= command_threshold).unsqueeze(-1)
+        in_contact = contact_time > 0.0
+        current_air = getattr(sensor.data, "current_air_time", None)
+        if current_air is not None:
+            air_ramp = torch.clamp(current_air / 0.10, min=0.0, max=1.0) * (~in_contact).float()
+        else:
+            air_ramp = (~in_contact).float()
+        walk_tgt = math.radians(stance_plantar_deg) + air_ramp * math.radians(
+            swing_plantar_deg - stance_plantar_deg
+        )
+        stand_tgt = torch.full_like(walk_tgt, math.radians(target_plantar_deg))
+        tgt_rad = torch.where(walking, walk_tgt, stand_tgt)
+        l_err = joint_pos[:, 4] - tgt_rad[:, 0]
+        r_err = joint_pos[:, 13] + tgt_rad[:, 1]
+    else:
+        target_rad = math.radians(target_plantar_deg)
+        l_err = joint_pos[:, 4] - target_rad
+        r_err = joint_pos[:, 13] + target_rad
 
     sq_err = torch.square(l_err) + torch.square(r_err)
     reward = torch.exp(-sq_err / (2.0 * std_rad * std_rad))
-    return torch.nan_to_num(reward, nan=0.0)
+
+    knee_sq = _ballet_stance_knee_sq(env, asset, sensor_name, command_name, command_threshold)
+    knee_gate = torch.exp(-knee_sq / (2.0 * knee_std_rad * knee_std_rad))
+    return torch.nan_to_num(reward * knee_gate, nan=0.0)
 
 
 def ballet_ankle_asymmetry_penalty(
     env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Penalize asymmetry between left and right ankles during tiptoe walking.
+    """Penalize ankle asymmetry during double support (free during single-support swing).
 
     Returns >= 0; use with negative weight.
     """
@@ -9768,6 +9844,11 @@ def ballet_ankle_asymmetry_penalty(
 
     # In microduck, left + right = 0 when symmetrical
     asym = torch.abs(joint_pos[:, 4] + joint_pos[:, 13])
+    sensor = getattr(env.scene, "sensors", {}).get(sensor_name)
+    contact_time = getattr(sensor.data, "current_contact_time", None) if sensor is not None else None
+    if contact_time is not None:
+        both_down = ((contact_time[:, 0] > 0.0) & (contact_time[:, 1] > 0.0)).float()
+        asym = asym * both_down
     return torch.nan_to_num(asym, nan=0.0)
 
 
@@ -9777,19 +9858,21 @@ def ballet_straight_knees_reward(
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
     min_ankle_deg: float = 26.0,
     target_ankle_deg: float = 55.0,
+    sensor_name: str = "feet_ground_contact",
+    command_name: str = "twist",
+    command_threshold: float = 0.01,
 ) -> torch.Tensor:
-    """Reward keeping knees extended straight (ballet elegance, not crouching).
+    """Reward keeping stance knees extended straight (ballet elegance, not crouching).
 
     Gated by ankle plantar-flexion: 0 reward at nominal flat foot (<=26 deg),
-    linearly ramping to 1.0 at >=55 deg. Forces tiptoe before awarding knee extension.
+    linearly ramping to 1.0 at >=55 deg. Evaluates stance/grounded knee(s) during
+    walking and both knees when standing.
     Returns [0, 1]; use with positive weight.
     """
     asset: Entity = env.scene[asset_cfg.name]
     joint_pos = _servo_joint_pos(env, asset)
 
-    l_knee = joint_pos[:, 3]
-    r_knee = joint_pos[:, 12]
-    sq_err = torch.square(l_knee) + torch.square(r_knee)
+    sq_err = _ballet_stance_knee_sq(env, asset, sensor_name, command_name, command_threshold)
     reward = torch.exp(-sq_err / (2.0 * std_rad * std_rad))
 
     # Tiptoe gate
@@ -9807,11 +9890,13 @@ def ballet_tall_trunk_height_reward(
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
     min_ankle_deg: float = 26.0,
     target_ankle_deg: float = 55.0,
+    sensor_name: str = "feet_ground_contact",
+    command_name: str = "twist",
+    command_threshold: float = 0.01,
 ) -> torch.Tensor:
     """Reward maintaining an elevated trunk height enabled by tiptoe standing/walking.
 
-    Gated by ankle plantar-flexion: zero reward at nominal flat foot (<=26 deg),
-    linearly ramping to 1.0 at >=55 deg. Prevents flat-foot cheating.
+    Gated by ankle plantar-flexion and stance knee extension to prevent flat-foot cheating.
     Returns [0, 1]; use with positive weight.
     """
     asset: Entity = env.scene[asset_cfg.name]
@@ -9826,7 +9911,9 @@ def ballet_tall_trunk_height_reward(
     r_ankle = -joint_pos[:, 13]
     mean_ankle_deg = torch.rad2deg(0.5 * (l_ankle + r_ankle))
     gate = torch.clamp((mean_ankle_deg - min_ankle_deg) / (target_ankle_deg - min_ankle_deg), min=0.0, max=1.0)
-    return torch.nan_to_num(reward * gate, nan=0.0)
+    knee_sq = _ballet_stance_knee_sq(env, asset, sensor_name, command_name, command_threshold)
+    knee_gate = torch.exp(-knee_sq / (2.0 * 0.25 * 0.25))
+    return torch.nan_to_num(reward * gate * knee_gate, nan=0.0)
 
 
 def ballet_flat_foot_contact_penalty(
@@ -9871,4 +9958,244 @@ def ballet_graceful_torso_penalty(
     proj_g = asset.data.projected_gravity_b
     tilt_sq = torch.square(proj_g[:, 0]) + torch.square(proj_g[:, 1])
     return torch.nan_to_num(tilt_sq, nan=0.0)
+
+
+def ballet_hip_centering_reward(
+    env: ManagerBasedRlEnv,
+    target_hip_deg: float = 19.2,
+    std_rad: float = 0.30,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    sensor_name: str = "feet_ground_contact",
+    command_name: str = "twist",
+    command_threshold: float = 0.01,
+) -> torch.Tensor:
+    """Reward keeping the fore-aft midpoint of both hips near the demipointe CoM equilibrium.
+
+    Left hip flexes forward negatively (-q_L), right hip flexes forward positively (+q_R).
+    Midpoint flexion = 0.5 * (-q_L + q_R). Alternating anti-phase strides (+delta, -delta)
+    cancel out in the midpoint, so this centers the stride under the CoM without blocking
+    walking steps.
+    Returns [0, 1]; use with positive weight.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    joint_pos = _servo_joint_pos(env, asset)
+    l_flex = -joint_pos[:, 2]
+    r_flex = joint_pos[:, 11]
+    mid_flex = 0.5 * (l_flex + r_flex)
+    target_rad = math.radians(target_hip_deg)
+    err = mid_flex - target_rad
+    reward = torch.exp(-torch.square(err) / (2.0 * std_rad * std_rad))
+    knee_sq = _ballet_stance_knee_sq(env, asset, sensor_name, command_name, command_threshold)
+    knee_gate = torch.exp(-knee_sq / (2.0 * 0.30 * 0.30))
+    return torch.nan_to_num(reward * knee_gate, nan=0.0)
+
+
+def ballet_hip_stagger_penalty(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+    command_threshold: float = 0.01,
+    tau_s: float = 1.0,
+    target_hip_deg: float = 19.2,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Penalize standing leg stagger / motion AND walking permanent one-leg lead limping.
+
+    During standing (cmd < threshold): penalizes instantaneous |q_hip_L + q_hip_R|,
+    deviation from the demipointe hip angle, and leg joint velocity.
+    During walking (cmd >= threshold): penalizes 0.5 * |EMA_1s(phi_L - phi_R)| so
+    alternating crossover steps cancel out while permanent one-foot-ahead limping is taxed.
+    Returns >= 0; use with negative weight.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    joint_pos = _servo_joint_pos(env, asset)
+    joint_vel = _servo_joint_vel(env, asset)
+    # diff = -(q_L + q_R) = phi_L - phi_R (0 when legs are side-by-side)
+    stagger = -(joint_pos[:, 2] + joint_pos[:, 11])
+    leg_vel_sq = torch.sum(
+        torch.square(joint_vel[:, :5]) + torch.square(joint_vel[:, 9:14]), dim=-1
+    )
+
+    if not hasattr(env, "_ballet_hip_stagger_ema") or env._ballet_hip_stagger_ema.shape[0] != env.num_envs:
+        env._ballet_hip_stagger_ema = torch.zeros(env.num_envs, device=env.device)
+    fresh = env.episode_length_buf <= 1
+    env._ballet_hip_stagger_ema[fresh] = 0.0
+
+    alpha = min(1.0, float(env.step_dt) / max(tau_s, 1e-6))
+    env._ballet_hip_stagger_ema = (1.0 - alpha) * env._ballet_hip_stagger_ema + alpha * stagger
+
+    cmd = env.command_manager.get_command(command_name)
+    speed = torch.norm(cmd[:, :2], dim=1) + torch.abs(cmd[:, 2])
+    standing = speed < command_threshold
+
+    target_rad = math.radians(target_hip_deg)
+    stand_err = (
+        torch.abs(stagger)
+        + 0.3 * (torch.abs(-joint_pos[:, 2] - target_rad) + torch.abs(joint_pos[:, 11] - target_rad))
+        + 0.06 * leg_vel_sq
+    )
+    walk_err = 1.5 * torch.abs(env._ballet_hip_stagger_ema)
+    cost = torch.where(standing, stand_err, walk_err)
+    return torch.nan_to_num(cost, nan=0.0)
+
+
+def ballet_short_step_penalty(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    command_name: str = "twist",
+    command_threshold: float = 0.01,
+    min_swing_s: float = 0.18,
+    min_stance_s: float = 0.18,
+) -> torch.Tensor:
+    """Penalize frantic high-frequency micro-tapping (short completed air or stance phases).
+
+    At foot touchdown (compute_first_contact), penalizes completed air phases shorter
+    than min_swing_s with a smooth linear ramp (1 at 0s -> 0 at min_swing_s).
+    At foot liftoff (compute_first_air), penalizes completed stance phases shorter
+    than min_stance_s. Does not tax swing initiation continuously at liftoff.
+    Returns >= 0; use with negative weight.
+    """
+    from mjlab.sensor import ContactSensor
+    sensor: ContactSensor = env.scene[sensor_name]
+    cmd = env.command_manager.get_command(command_name)
+    speed = torch.norm(cmd[:, :2], dim=-1) + torch.abs(cmd[:, 2])
+    settled = (env.episode_length_buf > 5).float()
+    active = (speed >= command_threshold).float() * settled
+
+    first_contact = sensor.compute_first_contact(env.step_dt)
+    last_air = sensor.data.last_air_time
+    assert last_air is not None
+    short_swing = (
+        first_contact.float()
+        * (last_air > 0.0).float()
+        * torch.clamp((min_swing_s - last_air) / max(min_swing_s, 1e-4), min=0.0)
+    )
+
+    first_air = sensor.compute_first_air(env.step_dt)
+    last_contact = sensor.data.last_contact_time
+    assert last_contact is not None
+    short_stance = (
+        first_air.float()
+        * (last_contact > 0.0).float()
+        * torch.clamp((min_stance_s - last_contact) / max(min_stance_s, 1e-4), min=0.0)
+    )
+
+    cost = (short_swing + short_stance).sum(dim=-1) * active
+    return torch.nan_to_num(cost, nan=0.0)
+
+
+def ballet_graceful_stride_reward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    height_sensor_name: str = "foot_height_scan",
+    command_name: str = "twist",
+    command_threshold: float = 0.01,
+    min_air_s: float = 0.04,
+    target_air_s: float = 0.20,
+    max_air_s: float = 0.50,
+    min_site_z: float = 0.019,
+    target_site_z: float = 0.032,
+    swing_plantar_deg: float = 68.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Reward slow, high-clearance, alternating crossover + pointed-toe ballet strides.
+
+    Pays in single support (exactly 1 foot grounded, 1 foot swinging) when walking and
+    making velocity progress:
+    - air_prog ramps from min_air_s (0.04 s) to target_air_s (0.20 s).
+    - clr_prog rewards lifting the swinging foot site from 19 mm to 32 mm.
+    - lead_reach rewards the swinging foot crossing AHEAD of the stance foot (blocking
+      permanent one-leg-lead limping; uses absolute separation when walking backward).
+    - pointe_score rewards extending the airborne swing ankle toward ``swing_plantar_deg``
+      (68 deg) while tight velocity/yaw gates prevent marching in place.
+    Returns >= 0; use with positive weight.
+    """
+    from mjlab.sensor import ContactSensor, TerrainHeightSensor
+    sensor: ContactSensor = env.scene[sensor_name]
+    height_sensor: TerrainHeightSensor = env.scene[height_sensor_name]
+    asset: Entity = env.scene[asset_cfg.name]
+
+    contact_time = sensor.data.current_contact_time
+    current_air = sensor.data.current_air_time
+    assert contact_time is not None and current_air is not None
+
+    in_contact = contact_time > 0.0
+    single_support = (in_contact.float().sum(dim=-1) == 1.0).float()
+    swing_mask = (~in_contact).float()
+
+    air_t = (current_air * swing_mask).sum(dim=-1)
+    air_prog = (
+        torch.clamp((air_t - min_air_s) / max(target_air_s - min_air_s, 1e-4), min=0.0, max=1.0)
+        * (air_t < max_air_s).float()
+    )
+
+    foot_heights = height_sensor.data.heights
+    swing_site_z = (foot_heights * swing_mask).sum(dim=-1)
+    clr_prog = torch.clamp((swing_site_z - min_site_z) / max(target_site_z - min_site_z, 1e-4), min=0.0, max=1.0)
+
+    joint_pos = _servo_joint_pos(env, asset)
+    cmd = env.command_manager.get_command(command_name)
+    speed = torch.norm(cmd[:, :2], dim=-1) + torch.abs(cmd[:, 2])
+    active = (speed >= command_threshold).float()
+
+    l_flex = -joint_pos[:, 2]
+    r_flex = joint_pos[:, 11]
+    lead_reach_l = torch.clamp(l_flex - r_flex, min=0.0, max=0.35) / 0.35
+    lead_reach_r = torch.clamp(r_flex - l_flex, min=0.0, max=0.35) / 0.35
+    fwd_cross = swing_mask[:, 0] * lead_reach_l + swing_mask[:, 1] * lead_reach_r
+    back_sep = torch.clamp(torch.abs(l_flex - r_flex), max=0.35) / 0.35
+    lead_reach = torch.where(cmd[:, 0] >= -0.01, fwd_cross, back_sep)
+
+    swing_ank = swing_mask[:, 0] * joint_pos[:, 4] + swing_mask[:, 1] * (-joint_pos[:, 13])
+    pointe_score = torch.exp(
+        -torch.square(swing_ank - math.radians(swing_plantar_deg)) / (2.0 * 0.25 * 0.25)
+    )
+
+    lin_vel_b = asset.data.root_link_lin_vel_b[:, :2]
+    ang_vel_b = asset.data.root_link_ang_vel_b[:, 2]
+    lin_err_sq = torch.sum(torch.square(cmd[:, :2] - lin_vel_b), dim=-1)
+    ang_err_sq = torch.square(cmd[:, 2] - ang_vel_b)
+    vel_gate = (
+        torch.exp(-lin_err_sq / (2.0 * 0.10 * 0.10))
+        * torch.exp(-ang_err_sq / (2.0 * 0.28 * 0.28))
+    )
+    fwd_gate = torch.where(
+        cmd[:, 0] > 0.02,
+        torch.clamp(lin_vel_b[:, 0] / torch.clamp(cmd[:, 0], min=0.02), min=0.0, max=1.0),
+        torch.ones_like(lin_vel_b[:, 0]),
+    )
+
+    reward = (
+        active
+        * single_support
+        * air_prog
+        * (0.15 + 0.85 * lead_reach)
+        * (0.25 + 0.45 * clr_prog + 0.30 * pointe_score)
+        * vel_gate
+        * fwd_gate
+    )
+    return torch.nan_to_num(reward, nan=0.0)
+
+
+def ballet_head_poise_penalty(
+    env: ManagerBasedRlEnv,
+    command_name: str = "head_pose",
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Penalize 4-DOF head/neck pose error and angular whipping velocity.
+
+    Locks neck_pitch, head_pitch, head_yaw, and head_roll to HOME + commanded
+    ``head_pose`` while damping angular velocity so the 280 g head cannot be whipped
+    as a reaction-wheel counterweight.
+    Returns >= 0; use with negative weight.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    joint_pos = _servo_joint_pos(env, asset)
+    joint_vel = _servo_joint_vel(env, asset)
+    default_pos = _servo_default_joint_pos(env, asset)
+    cmd = env.command_manager.get_command(command_name)
+    head_err = (joint_pos[:, 5:9] - default_pos[:, 5:9]) - cmd[:, 0:4]
+    pos_cost = torch.sum(torch.abs(head_err) + torch.square(head_err), dim=-1)
+    vel_cost = 0.05 * torch.sum(torch.square(joint_vel[:, 5:9]), dim=-1)
+    cost = pos_cost + vel_cost
+    return torch.nan_to_num(cost, nan=0.0)
 
