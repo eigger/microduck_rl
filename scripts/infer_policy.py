@@ -410,7 +410,9 @@ class PolicyInference:
                     f"--{name.replace('_', '-')} policies use the unified 13D "
                     "command obs (61D); run with --new-cmd-obs"
                 )
-            import os, datetime
+            if name == "jump" and "ballet_jump" in os.path.basename(path).lower() and duration == 0.52:
+                duration = 1.0
+            import datetime
             mtime = datetime.datetime.fromtimestamp(os.path.getmtime(path)).strftime('%Y-%m-%d %H:%M:%S')
             print(f"\nLoading {name} policy from: {path} (Updated: {mtime})")
             self.behavior_sessions[name] = ort.InferenceSession(path)

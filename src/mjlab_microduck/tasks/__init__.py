@@ -98,6 +98,10 @@ from .microduck_ballet_env_cfg import (
     make_microduck_ballet_env_cfg,
     MicroduckBalletRlCfg,
 )
+from .microduck_ballet_jump_env_cfg import (
+    make_microduck_ballet_jump_env_cfg,
+    MicroduckBalletJumpRlCfg,
+)
 from .backlash import make_backlash_variant
 
 # Ballet task — graceful tiptoe walking gait (demipointe / pointe)
@@ -106,6 +110,15 @@ register_mjlab_task(
     env_cfg=make_microduck_ballet_env_cfg(),
     play_env_cfg=make_microduck_ballet_env_cfg(play=True),
     rl_cfg=MicroduckBalletRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Ballet Jump task — Grand Jeté (plie -> launch -> mid-air scissor split -> stand)
+register_mjlab_task(
+    task_id="Mjlab-BalletJump-Flat-MicroDuck",
+    env_cfg=make_microduck_ballet_jump_env_cfg(),
+    play_env_cfg=make_microduck_ballet_jump_env_cfg(play=True),
+    rl_cfg=MicroduckBalletJumpRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
 

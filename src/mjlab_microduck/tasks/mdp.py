@@ -8086,6 +8086,20 @@ def jump_straight_flight_reward(
     return torch.nan_to_num(score, nan=0.0)
 
 
+def _update_jump_min_trunk_z(env: ManagerBasedRlEnv, asset: Entity) -> torch.Tensor:
+    """Track running minimum trunk Z (relative to terrain origin) within each episode for hard crouch gating."""
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2],
+        nan=0.116,
+    )
+    if not hasattr(env, "_min_trunk_z") or env._min_trunk_z.shape[0] != z.shape[0]:
+        env._min_trunk_z = z.clone()
+    resets = env.episode_length_buf <= 1
+    env._min_trunk_z[resets] = z[resets]
+    env._min_trunk_z = torch.minimum(env._min_trunk_z, z)
+    return env._min_trunk_z
+
+
 def jump_crouch_reward(
     env: ManagerBasedRlEnv,
     sensor_name: str = "feet_ground_contact",
@@ -8107,7 +8121,10 @@ def jump_crouch_reward(
     active = (step_count <= max_step).float()
     
     min_z = _update_jump_min_trunk_z(env, asset)
-    z = torch.nan_to_num(asset.data.root_link_pos_w[:, 2], nan=target_z)
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2],
+        nan=target_z,
+    )
     z_err = torch.square(z - target_z)
     reward_z = torch.exp(-z_err / (std_z ** 2))
     
@@ -8123,7 +8140,8 @@ def jump_crouch_reward(
     knee_gate = torch.clamp(knee_flex / min_knee_flexion, min=0.0, max=1.0)
 
     # In-place crouch: trunk stays over feet (std 45mm allows natural sagittal pelvis shift)
-    dx = asset.data.root_link_pos_w[:, 0] - env.scene.env_origins[:, 0]
+    start_xy, start_yaw, xy, _ = _jump_spawn_frame(env, asset)
+    dx, _ = spawn_frame_offset(start_xy, start_yaw, xy)
     x_gate = torch.exp(-torch.square(dx) / (0.045 ** 2))
     
     env.extras["log"]["Metrics/crouch_min_z_mm"] = torch.mean(min_z * 1000.0)
@@ -8164,20 +8182,20 @@ def jump_takeoff_velocity_reward(
     gy = asset.data.projected_gravity_b[:, 1]
     roll_gate = torch.exp(-torch.square(gy) / (0.139 ** 2))
 
-    # Vertical takeoff purity: enforce zero sagittal pitching, zero forward velocity, zero yaw heading, and zero angular velocity during thrust!
+    # Vertical takeoff purity: enforce zero sagittal pitching, zero forward velocity, and heading lock during thrust!
     gx = asset.data.projected_gravity_b[:, 0]
     pitch_gate = torch.exp(-torch.square(gx) / (0.174 ** 2))  # std 10 deg
 
-    vx = asset.data.root_link_lin_vel_w[:, 0]
+    start_xy, start_yaw, xy, yaw = _jump_spawn_frame(env, asset)
+    dx, _ = spawn_frame_offset(start_xy, start_yaw, xy)
+    vx, _ = spawn_frame_offset(
+        torch.zeros_like(xy), start_yaw, asset.data.root_link_lin_vel_w[:, :2]
+    )
     vx_gate = torch.exp(-torch.square(vx) / (0.25 ** 2))  # std 0.25 m/s
-
-    dx = asset.data.root_link_pos_w[:, 0] - env.scene.env_origins[:, 0]
     dx_gate = torch.exp(-torch.square(dx) / (0.030 ** 2))  # std 30mm
 
-    siny = 2.0 * (quat[:, 0] * quat[:, 3] + quat[:, 1] * quat[:, 2])
-    cosy = 1.0 - 2.0 * (quat[:, 2] ** 2 + quat[:, 3] ** 2)
-    yaw = torch.atan2(siny, cosy)
-    takeoff_yaw_gate = torch.exp(-torch.square(yaw) / (0.35 ** 2))  # std 20.0 deg (alive gradient)
+    yaw_err = torch.atan2(torch.sin(yaw - start_yaw), torch.cos(yaw - start_yaw))
+    takeoff_yaw_gate = torch.exp(-torch.square(yaw_err) / (0.35 ** 2))  # std 20.0 deg (alive gradient)
     
     return active * upright * roll_gate * pitch_gate * vx_gate * dx_gate * takeoff_yaw_gate * vz_score * crouch_gate
 
@@ -8187,10 +8205,13 @@ STAND_Z = 0.117  # trunk height at nominal standing pose (measured from sim)
 
 def _update_jump_max_trunk_z(env: ManagerBasedRlEnv, asset: Entity) -> torch.Tensor:
     """Track running MAXIMUM trunk Z within each episode for absolute jump height reward."""
-    z = torch.nan_to_num(asset.data.root_link_pos_w[:, 2], nan=STAND_Z)
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2],
+        nan=STAND_Z,
+    )
     if not hasattr(env, "_max_trunk_z") or env._max_trunk_z.shape[0] != z.shape[0]:
         env._max_trunk_z = z.clone()
-    resets = (env.episode_length_buf == 0)
+    resets = env.episode_length_buf <= 1
     env._max_trunk_z[resets] = z[resets]
     env._max_trunk_z = torch.maximum(env._max_trunk_z, z)
     return env._max_trunk_z
@@ -8207,6 +8228,7 @@ def jump_flight_reward(
     max_step: int = 26,
     min_crouch_z: float = 0.088,
     full_crouch_z: float = 0.070,
+    max_clearance_score: float = 2.0,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """Phase 3: Absolute jump height and apex clearance (Gen 10 — Anti-Cheat Design).
@@ -8237,13 +8259,15 @@ def jump_flight_reward(
     gy = asset.data.projected_gravity_b[:, 1]
     roll_gate = torch.exp(-torch.square(gy) / (0.139 ** 2))
 
-    siny = 2.0 * (quat[:, 0] * quat[:, 3] + quat[:, 1] * quat[:, 2])
-    cosy = 1.0 - 2.0 * (quat[:, 2] ** 2 + quat[:, 3] ** 2)
-    yaw = torch.atan2(siny, cosy)
-    flight_yaw_gate = torch.exp(-torch.square(yaw) / (0.35 ** 2))  # std 20.0 deg (alive gradient)
+    start_xy, start_yaw, xy, yaw = _jump_spawn_frame(env, asset)
+    yaw_err = torch.atan2(torch.sin(yaw - start_yaw), torch.cos(yaw - start_yaw))
+    flight_yaw_gate = torch.exp(-torch.square(yaw_err) / (0.35 ** 2))  # std 20.0 deg (alive gradient)
 
     # Trunk height score above standing (instantaneous at airborne steps)
-    z = torch.nan_to_num(asset.data.root_link_pos_w[:, 2], nan=0.0)
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2],
+        nan=0.0,
+    )
     max_z = _update_jump_max_trunk_z(env, asset)
     height_score = torch.clamp(
         (z - stand_z) / max(1e-4, target_height - stand_z),
@@ -8256,17 +8280,20 @@ def jump_flight_reward(
             asset.site_names.index("left_foot"),
             asset.site_names.index("right_foot"),
         ]
-    feet_z = asset.data.site_pos_w[:, env._foot_site_ids, 2]
+    feet_z = (
+        asset.data.site_pos_w[:, env._foot_site_ids, 2]
+        - env.scene.terrain.env_origins[:, 2:3]
+    )
     min_foot_z = torch.min(feet_z, dim=-1).values
     clearance = torch.clamp(min_foot_z - 0.0147, min=0.0)
     clearance_score = torch.clamp(
         (clearance - min_clearance) / max(1e-4, target_clearance - min_clearance),
         min=0.0,
-        max=2.0,
+        max=max_clearance_score,
     )
 
     # Forward displacement gate: must stay in-place near spawn origin (std 8cm)
-    dx = asset.data.root_link_pos_w[:, 0] - env.scene.env_origins[:, 0]
+    dx, _ = spawn_frame_offset(start_xy, start_yaw, xy)
     fwd_gate = torch.exp(-torch.square(dx) / (0.08 ** 2))
 
     # Zero yaw lock: airborne body must face forward to earn flight reward
@@ -8381,15 +8408,10 @@ def jump_scissor_split_reward(
     # Weighted split score: dominated by bilateral reach so one-legged cheat earns zero
     split_score = 0.65 * bilateral_split + 0.35 * total_split
 
-    # Center of support: feet should straddle trunk evenly
+    # Center of support: feet should straddle trunk evenly (relaxed std so
+    # natural takeoff tuck does not zero the gradient)
     center = 0.5 * (s0 + s1)
-    center_score = torch.exp(-torch.square(center) / (0.035**2))
-
-    # Anti-spear gate: right ankle must NOT point straight down at ground
-    joint_pos = _servo_joint_pos(env, asset)
-    r_ankle = joint_pos[:, 13]
-    ankle_spear = torch.clamp(-r_ankle - 0.50, min=0.0)
-    ankle_gate = torch.exp(-ankle_spear / 0.15)
+    center_score = torch.exp(-torch.square(center) / (0.070**2))
 
     cos_tilt = 1.0 - 2.0 * (qx**2 + qy**2)
     upright = torch.clamp(cos_tilt, min=0.0)
@@ -8397,10 +8419,9 @@ def jump_scissor_split_reward(
     gy = asset.data.projected_gravity_b[:, 1]
     roll_gate = torch.exp(-torch.square(gy) / (0.139 ** 2))
 
-    siny = 2.0 * (w * qz + qx * qy)
-    cosy = 1.0 - 2.0 * (qy**2 + qz**2)
-    yaw = torch.atan2(siny, cosy)
-    yaw_gate = torch.exp(-torch.square(yaw) / (0.35 ** 2))
+    _, start_yaw, _, yaw = _jump_spawn_frame(env, asset)
+    yaw_err = torch.atan2(torch.sin(yaw - start_yaw), torch.cos(yaw - start_yaw))
+    yaw_gate = torch.exp(-torch.square(yaw_err) / (0.35 ** 2))
 
     # Flight gate: MUST be airborne
     contacts = sensor.data.found
@@ -8417,10 +8438,177 @@ def jump_scissor_split_reward(
     env.extras["log"]["Metrics/front_reach_mm"] = torch.mean(s0 * 1000.0)
     env.extras["log"]["Metrics/rear_reach_mm"] = torch.mean((-s1) * 1000.0)
 
-    return active * upright * roll_gate * yaw_gate * flight_gate * elevation_gate * split_score * center_score * ankle_gate
+    return active * upright * roll_gate * yaw_gate * flight_gate * elevation_gate * split_score * center_score
 
 
-def jump_landing_cushion_reward(
+def _ensure_foot_site_ids(env: ManagerBasedRlEnv, asset: Entity) -> list[int]:
+    if not hasattr(env, "_foot_site_ids"):
+        env._foot_site_ids = [
+            asset.site_names.index("left_foot"),
+            asset.site_names.index("right_foot"),
+        ]
+    return env._foot_site_ids
+
+
+def _foot_sagittal_coords(
+    env: ManagerBasedRlEnv,
+    asset: Entity,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return (s_left, s_right, feet_pos_w) sagittal foot coords in trunk heading."""
+    foot_ids = _ensure_foot_site_ids(env, asset)
+    quat = asset.data.root_link_quat_w
+    w, qx, qy, qz = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+    fwd_x = 1.0 - 2.0 * (qy**2 + qz**2)
+    fwd_y = 2.0 * (qx * qy + w * qz)
+    fwd_norm = torch.clamp(torch.sqrt(fwd_x**2 + fwd_y**2), min=1e-6)
+    fwd_x = fwd_x / fwd_norm
+    fwd_y = fwd_y / fwd_norm
+
+    feet_pos_w = asset.data.site_pos_w[:, foot_ids, :]
+    dpos_xy = feet_pos_w[:, :, :2] - asset.data.root_link_pos_w[:, :2].unsqueeze(1)
+    s0 = dpos_xy[:, 0, 0] * fwd_x + dpos_xy[:, 0, 1] * fwd_y
+    s1 = dpos_xy[:, 1, 0] * fwd_x + dpos_xy[:, 1, 1] * fwd_y
+    return s0, s1, feet_pos_w
+
+
+def _foot_sole_x_axis_z(env: ManagerBasedRlEnv, asset: Entity) -> torch.Tensor:
+    """Return world Z component of each foot site's local forward X-axis (+ = heel-rock, - = pointe)."""
+    foot_ids = _ensure_foot_site_ids(env, asset)
+    quats = asset.data.site_quat_w[:, foot_ids, :]
+    w, qx, qy, qz = quats[:, :, 0], quats[:, :, 1], quats[:, :, 2], quats[:, :, 3]
+    return 2.0 * (qx * qz - w * qy)
+
+
+def jump_ballet_grand_jete_reward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    min_step: int = 11,
+    max_step: int = 20,
+    min_crouch_z: float = 0.096,
+    full_crouch_z: float = 0.078,
+    target_l_hip: float = -1.43,
+    target_r_hip: float = 0.14,
+    target_l_knee: float = -0.73,
+    target_r_knee: float = 0.73,
+    target_l_ankle: float = 1.40,
+    target_r_ankle: float = -1.40,
+    std_hip: float = 0.55,
+    std_knee: float = 0.70,
+    std_ankle: float = 0.75,
+    target_split: float = 0.105,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Reward true straight-leg, pointed-toe aerial Grand Jete split in mid-air."""
+    asset: Entity = env.scene[asset_cfg.name]
+    sensor = env.scene[sensor_name]
+    step_count = env.episode_length_buf
+    active = ((step_count >= min_step) & (step_count <= max_step)).float()
+
+    min_z = _update_jump_min_trunk_z(env, asset)
+    crouch_gate = torch.clamp(
+        (min_crouch_z - min_z) / (min_crouch_z - full_crouch_z), min=0.0, max=1.0
+    )
+
+    contacts = sensor.data.found
+    both_in_air = (torch.sum(contacts, dim=-1) == 0).float()
+
+    quat = asset.data.root_link_quat_w
+    cos_tilt = 1.0 - 2.0 * (quat[:, 1] ** 2 + quat[:, 2] ** 2)
+    upright = torch.clamp(cos_tilt, min=0.0)
+
+    gy = asset.data.projected_gravity_b[:, 1]
+    roll_gate = torch.exp(-torch.square(gy) / (0.139 ** 2))
+
+    _, start_yaw, _, yaw = _jump_spawn_frame(env, asset)
+    yaw_err = torch.atan2(torch.sin(yaw - start_yaw), torch.cos(yaw - start_yaw))
+    yaw_gate = torch.exp(-torch.square(yaw_err) / (0.35 ** 2))
+
+    s0, s1, feet_pos_w = _foot_sagittal_coords(env, asset)
+    feet_z = feet_pos_w[:, :, 2] - env.scene.terrain.env_origins[:, 2:3]
+    min_foot_z = torch.min(feet_z, dim=-1).values
+    elevation_gate = torch.clamp((min_foot_z - 0.014) / 0.018, min=0.0, max=1.0)
+
+    joint_pos = _servo_joint_pos(env, asset)
+    hip_sq = 0.5 * (
+        torch.square(joint_pos[:, 2] - target_l_hip)
+        + torch.square(joint_pos[:, 11] - target_r_hip)
+    )
+    knee_sq = 0.5 * (
+        torch.square(joint_pos[:, 3] - target_l_knee)
+        + torch.square(joint_pos[:, 12] - target_r_knee)
+    )
+    ankle_sq = 0.5 * (
+        torch.square(joint_pos[:, 4] - target_l_ankle)
+        + torch.square(joint_pos[:, 13] - target_r_ankle)
+    )
+    pose_score = (
+        torch.exp(-hip_sq / (std_hip ** 2))
+        * torch.exp(-knee_sq / (std_knee ** 2))
+        * torch.exp(-ankle_sq / (std_ankle ** 2))
+    )
+
+    split_dist = torch.clamp(s0 - s1, min=0.0)
+    split_norm = torch.clamp(split_dist / target_split, min=0.0, max=1.2)
+    score = pose_score * (0.70 + 0.30 * split_norm)
+
+    fpitch_deg = torch.rad2deg(torch.asin(torch.clamp(_foot_sole_x_axis_z(env, asset), -1.0, 1.0)))
+    air_mask = (active > 0.5) & (both_in_air > 0.5)
+    m = air_mask if bool(torch.any(air_mask)) else slice(None)
+    env.extras["log"]["Metrics/scissor_split_mm"] = torch.mean(split_dist[m] * 1000.0)
+    env.extras["log"]["Metrics/ballet_pose_score"] = torch.mean(pose_score[m])
+    env.extras["log"]["Metrics/ballet_l_knee_deg"] = torch.mean(torch.rad2deg(joint_pos[m, 3]))
+    env.extras["log"]["Metrics/ballet_r_knee_deg"] = torch.mean(torch.rad2deg(joint_pos[m, 12]))
+    env.extras["log"]["Metrics/ballet_l_ankle_deg"] = torch.mean(torch.rad2deg(joint_pos[m, 4]))
+    env.extras["log"]["Metrics/ballet_r_ankle_deg"] = torch.mean(torch.rad2deg(joint_pos[m, 13]))
+    env.extras["log"]["Metrics/ballet_l_fpitch_deg"] = torch.mean(fpitch_deg[m, 0])
+    env.extras["log"]["Metrics/ballet_r_fpitch_deg"] = torch.mean(fpitch_deg[m, 1])
+
+    return torch.nan_to_num(
+        active * crouch_gate * both_in_air * upright * roll_gate * yaw_gate * elevation_gate * score,
+        nan=0.0,
+    )
+
+
+def jump_grounded_sole_level_penalty(
+    env: ManagerBasedRlEnv,
+    crouch_max_step: int = 9,
+    land_min_step: int = 26,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Penalize heel-rocking during plie crouch and uneven sole tilt during landing rest.
+
+    Returns >= 0 (standard cost function); use with negative weight.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    step_count = env.episode_length_buf
+    x_axis_z = _foot_sole_x_axis_z(env, asset)
+
+    crouch_active = (step_count <= crouch_max_step).float()
+    heel_cost = torch.sum(torch.square(torch.clamp(x_axis_z - 0.08, min=0.0)), dim=-1)
+
+    land_active = (step_count >= land_min_step).float()
+    level_cost = torch.sum(torch.square(x_axis_z), dim=-1)
+
+    return torch.nan_to_num(crouch_active * heel_cost + land_active * level_cost, nan=0.0)
+
+
+def jump_post_landing_feet_align_penalty(
+    env: ManagerBasedRlEnv,
+    min_step: int = 24,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Penalize staggered sagittal foot separation after landing so both feet close neatly.
+
+    Returns >= 0 (standard cost function); use with negative weight.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    active = (env.episode_length_buf >= min_step).float()
+    s0, s1, _ = _foot_sagittal_coords(env, asset)
+    diff = torch.abs(s0 - s1)
+    return torch.nan_to_num(active * (torch.square(diff) + 0.08 * diff), nan=0.0)
+
+
+def jump_cmj_landing_cushion_reward(
     env: ManagerBasedRlEnv,
     sensor_name: str = "feet_ground_contact",
     min_air_time: float = 0.04,
@@ -8429,29 +8617,33 @@ def jump_landing_cushion_reward(
     max_step: int = 34,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Phase 4: Spring-like compliant touchdown & cushioning (t in 0.48s - 0.68s).
-    
+    """Phase 4 (CMJ): Spring-like compliant touchdown & cushioning (t in 0.48s - 0.68s).
+
     CRITICAL ANTI-CAMPING GATE:
-    Can ONLY be earned if the robot was ACTUALLY in the air before landing!
+    Requires BOTH crouching below 88 mm AND airborne flight before landing!
     """
     asset: Entity = env.scene[asset_cfg.name]
     sensor = env.scene[sensor_name]
-    
+
     step_count = env.episode_length_buf
     active = ((step_count >= min_step) & (step_count <= max_step)).float()
-    
-    has_jumped = (torch.max(sensor.data.last_air_time, dim=-1).values > min_air_time).float()
+
+    min_z = _update_jump_min_trunk_z(env, asset)
+    crouched = min_z < 0.096
+    has_jumped = (
+        (torch.max(sensor.data.last_air_time, dim=-1).values > min_air_time) & crouched
+    ).float()
     contacts = sensor.data.found
     both_feet_down = (torch.sum(contacts, dim=-1) >= 2).float()
-    
+
     quat = asset.data.root_link_quat_w
     cos_tilt = 1.0 - 2.0 * (quat[:, 1] ** 2 + quat[:, 2] ** 2)
     upright = torch.clamp(cos_tilt, min=0.0)
-    
+
     joint_pos = _servo_joint_pos(env, asset)
     knee_flex = 0.5 * (torch.abs(joint_pos[:, 3]) + torch.abs(joint_pos[:, 12]))
     cushion_gate = torch.clamp(knee_flex / min_knee_flexion, min=0.0, max=1.0)
-    
+
     return active * has_jumped * both_feet_down * upright * cushion_gate
 
 
@@ -8463,43 +8655,52 @@ def jump_landing_rest_reward(
     std_z: float = 0.018,
     std_pose: float = 0.25,
     min_step: int = 32,
+    leg_only: bool = False,
+    std_foot_align: float | None = None,
+    std_sole_level: float | None = None,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """Phase 5: Smooth rise and return to stable standing pose (t in 0.64s - 1.00s).
-    
+
     CRITICAL ANTI-CAMPING GATE:
-    Can ONLY be earned if the robot was ACTUALLY in the air before landing!
-    Standing still gets 0.0!
+    Requires BOTH crouching below 88 mm AND airborne flight before landing!
+    Standing still or dropping straight from a tiptoe spawn gets 0.0!
     """
     asset: Entity = env.scene[asset_cfg.name]
     sensor = env.scene[sensor_name]
-    
+
     step_count = env.episode_length_buf
     active = (step_count >= min_step).float()
-    
-    has_jumped = (torch.max(sensor.data.last_air_time, dim=-1).values > min_air_time).float()
-    
-    z = torch.nan_to_num(asset.data.root_link_pos_w[:, 2], nan=target_z)
+
+    min_z = _update_jump_min_trunk_z(env, asset)
+    crouched = min_z < 0.096
+    has_jumped = (
+        (torch.max(sensor.data.last_air_time, dim=-1).values > min_air_time) & crouched
+    ).float()
+
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2],
+        nan=target_z,
+    )
     z_err = torch.square(z - target_z)
     reward_z = torch.exp(-z_err / (std_z ** 2))
-    
+
     quat = asset.data.root_link_quat_w
     cos_tilt = 1.0 - 2.0 * (quat[:, 1] ** 2 + quat[:, 2] ** 2)
     upright = torch.clamp(cos_tilt, min=0.0)
 
-    # Robot MUST face forward (nominal heading, yaw ~ 0) when settling into standing pose!
-    siny = 2.0 * (quat[:, 0] * quat[:, 3] + quat[:, 1] * quat[:, 2])
-    cosy = 1.0 - 2.0 * (quat[:, 2] ** 2 + quat[:, 3] ** 2)
-    yaw = torch.atan2(siny, cosy)
-    yaw_gate = torch.exp(-torch.square(yaw) / (0.35 ** 2))
+    # Robot MUST hold spawn heading (yaw_err ~ 0) when settling into standing pose!
+    start_xy, start_yaw, xy, yaw = _jump_spawn_frame(env, asset)
+    yaw_err = torch.atan2(torch.sin(yaw - start_yaw), torch.cos(yaw - start_yaw))
+    yaw_gate = torch.exp(-torch.square(yaw_err) / (0.35 ** 2))
 
     # Robot MUST come to a complete stop (zero horizontal velocity) after touchdown!
     v_xy = asset.data.root_link_lin_vel_w[:, :2]
     vel_err = torch.sum(torch.square(v_xy), dim=-1)
     vel_gate = torch.exp(-vel_err / (0.30 ** 2))
 
-    # Robot MUST land and rest at origin (X ~ 0, Y ~ 0), not leaping forward!
-    dpos_xy = asset.data.root_link_pos_w[:, :2] - env.scene.env_origins[:, :2]
+    # Robot MUST land and rest near spawn origin, not leaping forward!
+    dpos_xy = xy - start_xy
     pos_err_xy = torch.sum(torch.square(dpos_xy), dim=-1)
     pos_gate = torch.exp(-pos_err_xy / (0.08 ** 2))
 
@@ -8511,17 +8712,32 @@ def jump_landing_rest_reward(
     joint_vel = _servo_joint_vel(env, asset)
     jvel_sq = torch.mean(torch.square(joint_vel), dim=-1)
     quiet_gate = torch.exp(-jvel_sq / (1.2 ** 2))
-    
+
     joint_pos = _servo_joint_pos(env, asset)
     home = torch.tensor(
         [0.0, -0.0873, -0.4579, -0.0049, 0.4530, 0.3491, 0.3491, 0.0, 0.0, 0.0, 0.0873, 0.4579, 0.0049, -0.4530],
         device=joint_pos.device,
         dtype=joint_pos.dtype,
     )
-    pose_err = torch.mean(torch.square(joint_pos - home), dim=-1)
+    if leg_only:
+        leg_idx = (0, 1, 2, 3, 4, 9, 10, 11, 12, 13)
+        pose_err = torch.mean(torch.square(joint_pos[:, leg_idx] - home[list(leg_idx)]), dim=-1)
+    else:
+        pose_err = torch.mean(torch.square(joint_pos - home), dim=-1)
     reward_pose = torch.exp(-pose_err / (std_pose ** 2))
-    
-    return active * has_jumped * both_feet_down * reward_z * upright * reward_pose * yaw_gate * vel_gate * pos_gate * quiet_gate
+
+    extra_gate = torch.ones_like(reward_pose)
+    if std_foot_align is not None:
+        s0, s1, _ = _foot_sagittal_coords(env, asset)
+        extra_gate = extra_gate * torch.exp(-torch.square(s0 - s1) / (std_foot_align ** 2))
+    if std_sole_level is not None:
+        x_axis_z = _foot_sole_x_axis_z(env, asset)
+        extra_gate = extra_gate * torch.exp(-torch.sum(torch.square(x_axis_z), dim=-1) / (std_sole_level ** 2))
+
+    return (
+        active * has_jumped * both_feet_down * reward_z * upright * reward_pose
+        * yaw_gate * vel_gate * pos_gate * quiet_gate * extra_gate
+    )
 
 
 def jump_drift_penalty(
@@ -8624,19 +8840,20 @@ def head_orientation_exceeded(
 
 def knee_hyperextension_penalty(
     env: ManagerBasedRlEnv,
+    limit_rad: float = 0.04,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Penalize knees hyperextending backwards (left < 0 or right > 0).
+    """Penalize knees hyperextending backwards (left < -limit_rad or right > limit_rad).
     
     In Microduck coordinate convention, normal forward knee flexion is >= 0 for left
-    knee and <= 0 for right knee. Hyperextension bends the knee backward into deformity.
+    knee and <= 0 for right knee. Because CAD zero (0 rad) has ~57.5 deg digitigrade
+    flexion, straight-leg ballet poses require limit_rad ~ 1.02 rad.
     Returns <= 0 (self-negating penalty); use with positive weight.
     """
     asset: Entity = env.scene[asset_cfg.name]
     joint_pos = _servo_joint_pos(env, asset)
-    # Deadband of 0.04 rad: standing default (-0.005, +0.005) and full extension push (0.0) have zero penalty
-    left_bad = torch.clamp(-joint_pos[:, 3] - 0.04, min=0.0)
-    right_bad = torch.clamp(joint_pos[:, 12] - 0.04, min=0.0)
+    left_bad = torch.clamp(-joint_pos[:, 3] - limit_rad, min=0.0)
+    right_bad = torch.clamp(joint_pos[:, 12] - limit_rad, min=0.0)
     return -(left_bad + right_bad)
 
 
@@ -10198,4 +10415,112 @@ def ballet_head_poise_penalty(
     vel_cost = 0.05 * torch.sum(torch.square(joint_vel[:, 5:9]), dim=-1)
     cost = pos_cost + vel_cost
     return torch.nan_to_num(cost, nan=0.0)
+
+
+def reset_ballet_tiptoe_jump_spawn(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor | None = None,
+    fraction: float = 0.55,
+    ankle_range: tuple[float, float] = (0.60, 1.18),
+    knee_range: tuple[float, float] = (-0.02, 0.15),
+    hip_pitch_range: tuple[float, float] = (-0.45, -0.25),
+    stride_offset_range: tuple[float, float] = (-0.12, 0.12),
+    z_range: tuple[float, float] = (0.120, 0.129),
+    pitch_range: tuple[float, float] = (-0.06, 0.06),
+    roll_range: tuple[float, float] = (-0.04, 0.04),
+    lin_vel_x_range: tuple[float, float] = (-0.02, 0.10),
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> None:
+    """Spawn a fraction of jump episodes mid-ballet tiptoe walk (34°–68° ankles).
+
+    Must run AFTER ``reset_base`` and ``reset_robot_joints``. Bridges the OOD gap
+    between flat-footed HOME_FRAME (~26° ankles) and live ``ballet.onnx`` walk
+    handover states (45°–66° ankles, alternating swing knee, mild trunk velocity).
+    """
+    if env_ids is None:
+        env_ids = torch.arange(env.num_envs, device=env.device)
+    if len(env_ids) == 0:
+        return
+    env_ids = env_ids.to(env.device)
+
+    asset: Entity = env.scene[asset_cfg.name]
+    q_adr = asset.data.indexing.free_joint_q_adr
+
+    if fraction > 0.0:
+        n_pick = max(1, int(len(env_ids) * fraction))
+        perm = torch.randperm(len(env_ids), device=env.device)[:n_pick]
+        warm_ids = env_ids[perm]
+
+        servo_ids = _servo_joint_ids(env, asset)
+        joint_pos = asset.data.joint_pos[warm_ids].clone()
+        joint_vel = torch.zeros_like(joint_pos)
+
+        # Shared tiptoe progression u_ank correlates ankle extension with trunk Z
+        u_ank = torch.rand(n_pick, device=env.device)
+        ank_base = ankle_range[0] + u_ank * (ankle_range[1] - ankle_range[0])
+        ank_jit_l = (torch.rand(n_pick, device=env.device) * 2.0 - 1.0) * 0.04
+        ank_jit_r = (torch.rand(n_pick, device=env.device) * 2.0 - 1.0) * 0.04
+        l_ank = torch.clamp(ank_base + ank_jit_l, 0.50, 1.22)
+        r_ank = -torch.clamp(ank_base + ank_jit_r, 0.50, 1.22)
+
+        # Hip pitch: left negative forward, right positive forward, plus alternating stride
+        l_hip_base = hip_pitch_range[0] + torch.rand(n_pick, device=env.device) * (
+            hip_pitch_range[1] - hip_pitch_range[0]
+        )
+        stride = stride_offset_range[0] + torch.rand(n_pick, device=env.device) * (
+            stride_offset_range[1] - stride_offset_range[0]
+        )
+        l_hip = l_hip_base - stride
+        r_hip = -l_hip_base - stride
+
+        # Forward knee flexion convention: left >= 0, right <= 0
+        k_lo, k_hi = knee_range
+        l_knee = k_lo + torch.rand(n_pick, device=env.device) * (k_hi - k_lo)
+        r_knee = -(k_lo + torch.rand(n_pick, device=env.device) * (k_hi - k_lo))
+
+        # Subtle hip_roll/yaw jitter consistent with walking
+        s_pos = joint_pos[:, servo_ids]
+        s_pos[:, 0] = (torch.rand(n_pick, device=env.device) * 2.0 - 1.0) * 0.04
+        s_pos[:, 9] = (torch.rand(n_pick, device=env.device) * 2.0 - 1.0) * 0.04
+        s_pos[:, 2] = l_hip
+        s_pos[:, 11] = r_hip
+        s_pos[:, 3] = l_knee
+        s_pos[:, 12] = r_knee
+        s_pos[:, 4] = l_ank
+        s_pos[:, 13] = r_ank
+        joint_pos[:, servo_ids] = s_pos
+        asset.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=warm_ids)
+
+        root = asset.data.data.qpos[warm_ids][:, q_adr].clone()
+        z_jit = (torch.rand(n_pick, device=env.device) * 2.0 - 1.0) * 0.0015
+        z = z_range[0] + u_ank * (z_range[1] - z_range[0]) + z_jit
+        root[:, 2] = env.scene.terrain.env_origins[warm_ids, 2] + z
+
+        yaw = yaw_from_quat(root[:, 3:7])
+        roll = roll_range[0] + torch.rand(n_pick, device=env.device) * (roll_range[1] - roll_range[0])
+        pitch = pitch_range[0] + torch.rand(n_pick, device=env.device) * (pitch_range[1] - pitch_range[0])
+        cy, sy = torch.cos(0.5 * yaw), torch.sin(0.5 * yaw)
+        cp, sp = torch.cos(0.5 * pitch), torch.sin(0.5 * pitch)
+        cr, sr = torch.cos(0.5 * roll), torch.sin(0.5 * roll)
+        root[:, 3] = cr * cp * cy + sr * sp * sy
+        root[:, 4] = sr * cp * cy - cr * sp * sy
+        root[:, 5] = cr * sp * cy + sr * cp * sy
+        root[:, 6] = cr * cp * sy - sr * sp * cy
+        asset.write_root_link_pose_to_sim(root[:, :7], warm_ids)
+
+        vx_b = lin_vel_x_range[0] + torch.rand(n_pick, device=env.device) * (
+            lin_vel_x_range[1] - lin_vel_x_range[0]
+        )
+        vel = torch.zeros(n_pick, 6, device=env.device)
+        vel[:, 0] = vx_b * torch.cos(yaw)
+        vel[:, 1] = vx_b * torch.sin(yaw)
+        asset.write_root_link_velocity_to_sim(vel, warm_ids)
+
+    # Clear per-episode trunk Z trackers for all reset envs so previous episodes never leak.
+    z_all = asset.data.data.qpos[env_ids][:, q_adr][:, 2] - env.scene.terrain.env_origins[env_ids, 2]
+    if hasattr(env, "_min_trunk_z") and env._min_trunk_z.shape[0] == env.num_envs:
+        env._min_trunk_z[env_ids] = z_all
+    if hasattr(env, "_max_trunk_z") and env._max_trunk_z.shape[0] == env.num_envs:
+        env._max_trunk_z[env_ids] = z_all
+
 
