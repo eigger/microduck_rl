@@ -10524,3 +10524,299 @@ def reset_ballet_tiptoe_jump_spawn(
         env._max_trunk_z[env_ids] = z_all
 
 
+# === Ballet Turn (Arabesque Turn) ===
+
+_ARABESQUE_LEG_IDS = (0, 1, 2, 3, 4, 9, 10, 11, 12, 13)
+
+
+def ballet_turn_arabesque_pose_reward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    command_name: str = "twist",
+    turn_cmd_threshold: float = 0.5,
+    target_r_hip: float = -0.52,
+    target_r_knee: float = 0.88,
+    target_r_ankle: float = -1.35,
+    std_r_hip: float = 0.55,
+    std_r_knee: float = 0.45,
+    std_r_ankle: float = 0.55,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Reward one-legged Arabesque posture (right leg extended straight back, toe pointed) when turning."""
+    asset: Entity = env.scene[asset_cfg.name]
+    sensor = env.scene[sensor_name]
+    cmd = env.command_manager.get_command(command_name)
+    turn_mask = cmd[:, 2] > turn_cmd_threshold
+    is_turning = turn_mask.float()
+
+    s_left, s_right, feet_pos_w = _foot_sagittal_coords(env, asset)
+    origin_z = env.scene.terrain.env_origins[:, 2]
+    lf_z = feet_pos_w[:, 0, 2] - origin_z
+    rf_z = feet_pos_w[:, 1, 2] - origin_z
+    back_dist = s_left - s_right
+
+    r_contact = (sensor.data.found[:, 1] > 0).float()
+    not_r_contact = 1.0 - r_contact
+
+    proj_g_z = asset.data.projected_gravity_b[:, 2]
+    upright_gate = torch.clamp((-proj_g_z - 0.65) / 0.28, 0.0, 1.0)
+    stance_low_gate = torch.clamp((0.040 - lf_z) / 0.025, 0.0, 1.0)
+
+    h_score = torch.clamp((rf_z - 0.008) / 0.087, 0.0, 1.0)
+    back_score = torch.clamp((back_dist - 0.005) / 0.060, 0.0, 1.0)
+
+    joint_pos = _servo_joint_pos(env, asset)
+    r_hip = joint_pos[:, 11]
+    r_knee = joint_pos[:, 12]
+    r_ankle = joint_pos[:, 13]
+    ext_score = (
+        torch.exp(-torch.square((r_hip - target_r_hip) / std_r_hip))
+        * torch.exp(-torch.square((r_knee - target_r_knee) / std_r_knee))
+        * torch.exp(-torch.square((r_ankle - target_r_ankle) / std_r_ankle))
+    )
+
+    reward = (
+        is_turning
+        * upright_gate
+        * stance_low_gate
+        * (0.35 * h_score + 0.25 * back_score + 0.40 * h_score * back_score * ext_score * not_r_contact)
+    )
+
+    log = env.extras.setdefault("log", {})
+    m = turn_mask if bool(torch.any(turn_mask)) else slice(None)
+    log["Metrics/arabesque_rf_z_mm"] = torch.mean(rf_z[m] * 1000.0)
+    log["Metrics/arabesque_rf_back_mm"] = torch.mean(back_dist[m] * 1000.0)
+    log["Metrics/arabesque_r_knee_deg"] = torch.mean(torch.rad2deg(r_knee[m]))
+    log["Metrics/arabesque_r_ankle_deg"] = torch.mean(torch.rad2deg(r_ankle[m]))
+    log["Metrics/arabesque_r_contact_frac"] = torch.mean(r_contact[m])
+    log["Metrics/arabesque_lf_z_mm"] = torch.mean(lf_z[m] * 1000.0)
+    log["Metrics/arabesque_tilt_deg"] = torch.mean(
+        torch.rad2deg(torch.acos(torch.clamp(-proj_g_z[m], -1.0, 1.0)))
+    )
+
+    return torch.nan_to_num(reward, nan=0.0)
+
+
+def ballet_turn_spin_rate_reward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    command_name: str = "twist",
+    turn_cmd_threshold: float = 0.5,
+    std_wz: float = 1.0,
+    sustain_air_s: float = 0.90,
+    sustain_min: float = 0.35,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Reward commanded CCW yaw spin velocity gated on sustained single-leg Arabesque form."""
+    asset: Entity = env.scene[asset_cfg.name]
+    sensor = env.scene[sensor_name]
+    cmd = env.command_manager.get_command(command_name)
+    turn_mask = cmd[:, 2] > turn_cmd_threshold
+    is_turning = turn_mask.float()
+
+    s_left, s_right, feet_pos_w = _foot_sagittal_coords(env, asset)
+    origin_z = env.scene.terrain.env_origins[:, 2]
+    lf_z = feet_pos_w[:, 0, 2] - origin_z
+    rf_z = feet_pos_w[:, 1, 2] - origin_z
+    back_dist = s_left - s_right
+
+    not_r_contact = (sensor.data.found[:, 1] == 0).float()
+    rf_lift_gate = torch.clamp((rf_z - 0.020) / 0.055, 0.0, 1.0) * not_r_contact
+    rf_back_gate = torch.clamp((back_dist - 0.005) / 0.045, 0.0, 1.0)
+
+    proj_g_z = asset.data.projected_gravity_b[:, 2]
+    upright_gate = torch.clamp((-proj_g_z - 0.65) / 0.28, 0.0, 1.0)
+    stance_low_gate = torch.clamp((0.040 - lf_z) / 0.025, 0.0, 1.0)
+
+    air_time = sensor.data.current_air_time
+    r_air = air_time[:, 1] if air_time is not None else torch.zeros_like(rf_z)
+    sustain = sustain_min + (1.0 - sustain_min) * torch.clamp(r_air / sustain_air_s, 0.0, 1.0)
+
+    arabesque_gate = rf_lift_gate * (0.30 + 0.70 * rf_back_gate) * upright_gate * stance_low_gate * sustain
+
+    omega_z = asset.data.root_link_ang_vel_w[:, 2]
+    wz_cmd = cmd[:, 2].clamp(min=0.5)
+    spin_track = 0.75 * torch.exp(-torch.square((omega_z - wz_cmd) / std_wz)) + 0.25 * torch.clamp(
+        omega_z / wz_cmd, 0.0, 1.0
+    )
+
+    log = env.extras.setdefault("log", {})
+    m = turn_mask if bool(torch.any(turn_mask)) else slice(None)
+    log["Metrics/arabesque_wz_rad_s"] = torch.mean(omega_z[m])
+    log["Metrics/arabesque_gate_mean"] = torch.mean(arabesque_gate[m])
+    log["Metrics/arabesque_r_air_s"] = torch.mean(r_air[m])
+
+    return torch.nan_to_num(is_turning * arabesque_gate * spin_track, nan=0.0)
+
+
+def ballet_turn_stance_pose_reward(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+    turn_cmd_threshold: float = 0.5,
+    target_l_knee: float = -0.25,
+    std_l_knee: float = 0.45,
+    target_z: float = 0.124,
+    std_z: float = 0.022,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Reward poised stance leg height and knee extension while turning in Arabesque."""
+    asset: Entity = env.scene[asset_cfg.name]
+    cmd = env.command_manager.get_command(command_name)
+    is_turning = (cmd[:, 2] > turn_cmd_threshold).float()
+
+    trunk_z = asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2]
+    l_knee = _servo_joint_pos(env, asset)[:, 3]
+    upright_gate = torch.clamp((-asset.data.projected_gravity_b[:, 2] - 0.65) / 0.28, 0.0, 1.0)
+
+    reward = (
+        is_turning
+        * upright_gate
+        * torch.exp(-torch.square((l_knee - target_l_knee) / std_l_knee))
+        * torch.exp(-torch.square((trunk_z - target_z) / std_z))
+    )
+    return torch.nan_to_num(reward, nan=0.0)
+
+
+def ballet_turn_stand_rest_reward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    command_name: str = "twist",
+    turn_cmd_threshold: float = 0.5,
+    target_z: float = 0.117,
+    std_z: float = 0.015,
+    std_pose: float = 0.25,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Reward neat, still 2-foot HOME standing rest when turn command is zero."""
+    asset: Entity = env.scene[asset_cfg.name]
+    sensor = env.scene[sensor_name]
+    cmd = env.command_manager.get_command(command_name)
+    stand_mask = cmd[:, 2] <= turn_cmd_threshold
+    is_standing = stand_mask.float()
+
+    both_grounded = ((sensor.data.found[:, 0] > 0) & (sensor.data.found[:, 1] > 0)).float()
+    wz = asset.data.root_link_ang_vel_w[:, 2]
+    v_xy_sq = torch.sum(torch.square(asset.data.root_link_lin_vel_w[:, :2]), dim=-1)
+    proj_g_xy_sq = torch.sum(torch.square(asset.data.projected_gravity_b[:, :2]), dim=-1)
+    trunk_z = asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2]
+
+    jp_all = _servo_joint_pos(env, asset)
+    dp_all = _servo_default_joint_pos(env, asset)
+    leg_sq = torch.mean(torch.square(jp_all[:, _ARABESQUE_LEG_IDS] - dp_all[:, _ARABESQUE_LEG_IDS]), dim=-1)
+    head_sq = torch.mean(torch.square(jp_all[:, 5:9] - dp_all[:, 5:9]), dim=-1)
+
+    s_left, s_right, _ = _foot_sagittal_coords(env, asset)
+    stagger = s_left - s_right
+
+    x_axis_z = _foot_sole_x_axis_z(env, asset)
+    sole_sq = torch.sum(torch.square(x_axis_z), dim=-1)
+
+    leg_wide = torch.exp(-leg_sq / (0.70 ** 2))
+    z_wide = torch.exp(-torch.square((trunk_z - target_z) / 0.030))
+    align_wide = torch.exp(-torch.square(stagger / 0.08))
+    sole_wide = torch.exp(-sole_sq / (0.60 ** 2))
+    head_wide = torch.exp(-head_sq / (0.50 ** 2))
+
+    still_score = (
+        torch.exp(-torch.square(wz / 0.40))
+        * torch.exp(-v_xy_sq / 0.04)
+        * torch.exp(-proj_g_xy_sq / (0.14 ** 2))
+    )
+    tight_pose = (
+        torch.exp(-torch.square((trunk_z - target_z) / std_z))
+        * torch.exp(-leg_sq / (std_pose ** 2))
+        * torch.exp(-torch.square(stagger / 0.025))
+        * torch.exp(-sole_sq / (0.18 ** 2))
+        * torch.exp(-head_sq / (0.25 ** 2))
+    )
+    reward = is_standing * (
+        0.12 * both_grounded
+        + 0.18 * leg_wide
+        + 0.14 * z_wide
+        + 0.14 * align_wide
+        + 0.14 * sole_wide
+        + 0.08 * head_wide
+        + 0.20 * both_grounded * still_score * tight_pose
+    )
+
+    log = env.extras.setdefault("log", {})
+    sm = stand_mask if bool(torch.any(stand_mask)) else slice(None)
+    log["Metrics/arabesque_stand_z_mm"] = torch.mean(trunk_z[sm] * 1000.0)
+    log["Metrics/arabesque_stand_stagger_mm"] = torch.mean(torch.abs(stagger[sm]) * 1000.0)
+
+    return torch.nan_to_num(reward, nan=0.0)
+
+
+def ballet_turn_right_foot_down_penalty(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    command_name: str = "twist",
+    turn_cmd_threshold: float = 0.5,
+) -> torch.Tensor:
+    """Penalize right foot touching the floor during an active turn command (>= 0; use negative weight)."""
+    sensor = env.scene[sensor_name]
+    cmd = env.command_manager.get_command(command_name)
+    is_turning = (cmd[:, 2] > turn_cmd_threshold).float()
+    return torch.nan_to_num(is_turning * (sensor.data.found[:, 1] > 0).float(), nan=0.0)
+
+
+def ballet_turn_stay_in_place_penalty(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Penalize world XY translational velocity so turns stay centered in place (>= 0; use negative weight)."""
+    asset: Entity = env.scene[asset_cfg.name]
+    v_xy_sq = torch.sum(torch.square(asset.data.root_link_lin_vel_w[:, :2]), dim=-1)
+    return torch.nan_to_num(v_xy_sq, nan=0.0)
+
+
+def ballet_turn_stance_hop_penalty(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+    turn_cmd_threshold: float = 0.5,
+    max_free_z: float = 0.018,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Allow tiny micro-pivots on the stance foot while penalizing high aerial hopping (>= 0; use negative weight)."""
+    asset: Entity = env.scene[asset_cfg.name]
+    cmd = env.command_manager.get_command(command_name)
+    is_turning = (cmd[:, 2] > turn_cmd_threshold).float()
+    foot_ids = _ensure_foot_site_ids(env, asset)
+    lf_z = asset.data.site_pos_w[:, foot_ids[0], 2] - env.scene.terrain.env_origins[:, 2]
+    excess = torch.clamp(lf_z - max_free_z, min=0.0)
+    cost = excess / 0.020 + torch.square(excess / 0.020)
+    return torch.nan_to_num(is_turning * cost, nan=0.0)
+
+
+def ballet_turn_heel_rock_penalty(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+    turn_cmd_threshold: float = 0.5,
+    threshold: float = 0.10,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Penalize stance-foot heel-rocking (toes tilted up) while allowing flat or pointe pivot (>= 0; negative weight)."""
+    asset: Entity = env.scene[asset_cfg.name]
+    cmd = env.command_manager.get_command(command_name)
+    is_turning = (cmd[:, 2] > turn_cmd_threshold).float()
+    x_axis_z = _foot_sole_x_axis_z(env, asset)
+    cost = torch.square(torch.clamp(x_axis_z[:, 0] - threshold, min=0.0))
+    return torch.nan_to_num(is_turning * cost, nan=0.0)
+
+
+def ballet_turn_head_yaw_stand_penalty(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+    turn_cmd_threshold: float = 0.5,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Center head_yaw back to neutral during 2-foot stand/finish (>= 0; use negative weight)."""
+    asset: Entity = env.scene[asset_cfg.name]
+    cmd = env.command_manager.get_command(command_name)
+    is_standing = (cmd[:, 2] <= turn_cmd_threshold).float()
+    jp = _servo_joint_pos(env, asset)
+    dp = _servo_default_joint_pos(env, asset)
+    return torch.nan_to_num(is_standing * torch.square(jp[:, 7] - dp[:, 7]), nan=0.0)
+
+
+

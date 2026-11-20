@@ -1491,7 +1491,9 @@ def main():
         policy.vel_min_x = -0.3
         policy.vel_max_y = 0.2
         policy.vel_min_y = -0.2
-        policy.vel_max_ang = 1.5
+        policy.vel_max_ang = (
+            2.5 if (args.walking and "ballet_turn" in os.path.basename(args.walking).lower()) else 1.5
+        )
 
     # Set initial position to default pose
     freejoint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "trunk_base_freejoint")

@@ -102,6 +102,10 @@ from .microduck_ballet_jump_env_cfg import (
     make_microduck_ballet_jump_env_cfg,
     MicroduckBalletJumpRlCfg,
 )
+from .microduck_ballet_turn_env_cfg import (
+    make_microduck_ballet_turn_env_cfg,
+    MicroduckBalletTurnRlCfg,
+)
 from .backlash import make_backlash_variant
 
 # Ballet task — graceful tiptoe walking gait (demipointe / pointe)
@@ -119,6 +123,15 @@ register_mjlab_task(
     env_cfg=make_microduck_ballet_jump_env_cfg(),
     play_env_cfg=make_microduck_ballet_jump_env_cfg(play=True),
     rl_cfg=MicroduckBalletJumpRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Ballet Turn task — Command-gated one-legged Arabesque turn
+register_mjlab_task(
+    task_id="Mjlab-BalletTurn-Flat-MicroDuck",
+    env_cfg=make_microduck_ballet_turn_env_cfg(),
+    play_env_cfg=make_microduck_ballet_turn_env_cfg(play=True),
+    rl_cfg=MicroduckBalletTurnRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
 
